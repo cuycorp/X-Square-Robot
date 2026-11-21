@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Sync Desktop client -> vision agent -> WALLX WebSocket example.
+"""Sync Desktop client -> vision agent -> WALLX WebSocket relay example.
 
-WebUI owns the robot session and stopping. This example only changes the
-instruction in an observation; it forwards metadata and action replies intact.
+Supports both Anthropic Claude Messages API (ANTHROPIC_API_KEY) and any
+OpenAI-compatible Vision Chat Completions endpoint (AGENT_CHAT_URL).
+WebUI owns the robot session and stopping.
 """
 
 import argparse
@@ -22,9 +23,22 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
+from claude_policy import DEFAULT_CLAUDE_MODEL, extract_json_object, load_anthropic_api_key
+
 
 WALLX_URL = os.environ.get("WALLX_ENDPOINT", "wss://maas-api.x2robot.com/v1/vla/wallx")
 MAX_FRAME_BYTES = 32 * 1024 * 1024
+
+AGENT_SYSTEM_PROMPT = (
+    "You choose the next short manipulation instruction for a robot VLA. "
+    "Use the goal, current images, state, and instruction history. "
+    "Ground the instruction in visible objects and avoid repeating completed steps. "
+    "An operator controls stopping in WebUI. Do not claim that an instruction stops "
+    "the hardware. Return only JSON with non-empty string fields instruction and reason. "
+    "If you cannot choose a confident next step or the goal is already complete, "
+    "return an empty instruction; the relay will stop requesting new actions and "
+    "ask the operator to end the session."
+)
 
 
 def unpack(frame):
@@ -74,16 +88,35 @@ def json_state(value):
     raise TypeError(f"Unsupported state value: {type(value).__name__}")
 
 
+def _b64_payload(image):
+    if isinstance(image, bytes):
+        return base64.b64encode(image).decode("ascii")
+    if not isinstance(image, str) or not image:
+        raise ValueError("Missing JPEG observation")
+    if "," in image and image.lstrip().startswith("data:image/"):
+        return image.split(",", 1)[1]
+    return image
+
+
 class VisionAgent:
-    """Replace decide() with your planner; the relay remains the same.
+    """Sub-goal planner supporting Anthropic Claude and OpenAI-compatible endpoints."""
 
-    AGENT_CHAT_URL is a full vision-capable Chat Completions endpoint.
-    AGENT_API_KEY belongs to that service, separately from WALLX_API_KEY.
-    """
-
-    def __init__(self, url, model, key="", timeout=10):
-        self.url, self.model, self.key, self.timeout = url, model, key, timeout
+    def __init__(self, url="", model="", key="", timeout=15, provider="auto"):
+        self.url = url
+        self.model = model
+        self.key = key
+        self.timeout = timeout
+        self.provider = provider
         self.reason = ""
+
+    def _is_anthropic(self):
+        if self.provider == "anthropic":
+            return True
+        if self.provider == "openai":
+            return False
+        if self.url and "anthropic.com" not in self.url:
+            return False
+        return bool(self.key or load_anthropic_api_key())
 
     def decide(self, observation, goal, previous, history):
         context = {
@@ -92,44 +125,65 @@ class VisionAgent:
             "recent_instructions": list(history),
             "state": observation["observation"]["state"],
         }
-        content = [{"type": "text", "text": json.dumps(context, default=json_state)}]
         views = observation["observation"]["images"]
-        for name in ("front", "left_wrist", "right_wrist"):
-            image = views.get(name)
-            if isinstance(image, bytes):
-                image = base64.b64encode(image).decode("ascii")
-            if not isinstance(image, str) or not image:
-                raise ValueError(f"Missing JPEG observation: {name}")
-            content.extend([
-                {"type": "text", "text": name},
-                {"type": "image_url", "image_url": {"url": image if image.startswith("data:image/") else "data:image/jpeg;base64," + image}},
-            ])
-        body = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You choose the next short manipulation instruction for a robot VLA. "
-                        "Use the goal, current images, state, and instruction history. "
-                        "Ground the instruction in visible objects and avoid repeating completed steps. "
-                        "An operator controls stopping in WebUI. Do not claim that an instruction stops "
-                        "the hardware. Return only JSON with non-empty string fields instruction and reason. "
-                        "If you cannot choose a confident next step or the goal is already complete, "
-                        "return an empty instruction; the relay will stop requesting new actions and "
-                        "ask the operator to end the session."
-                    ),
-                },
-                {"role": "user", "content": content},
-            ],
-        }
-        headers = {"Content-Type": "application/json"}
-        if self.key:
-            headers["Authorization"] = "Bearer " + self.key
-        request = urllib.request.Request(self.url, json.dumps(body).encode(), headers=headers)
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            result = json.load(response)
-        decision = json.loads(result["choices"][0]["message"]["content"])
+
+        if self._is_anthropic():
+            api_key = self.key or load_anthropic_api_key()
+            if not api_key:
+                raise ValueError("ANTHROPIC_API_KEY is required for Anthropic VisionAgent")
+            endpoint = (self.url or "https://api.anthropic.com/v1/messages").rstrip("/")
+            if endpoint.endswith("api.anthropic.com"):
+                endpoint += "/v1/messages"
+            content = [{"type": "text", "text": json.dumps(context, default=json_state)}]
+            for name in ("front", "left_wrist", "right_wrist"):
+                b64 = _b64_payload(views.get(name))
+                content.extend([
+                    {"type": "text", "text": name},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                ])
+            body = {
+                "model": self.model or DEFAULT_CLAUDE_MODEL,
+                "max_tokens": 256,
+                "system": AGENT_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": content}],
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            }
+            request = urllib.request.Request(endpoint, json.dumps(body).encode(), headers=headers)
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                result = json.load(response)
+            text_parts = [blk.get("text", "") for blk in result.get("content", []) if blk.get("type") == "text"]
+            decision = extract_json_object("\n".join(text_parts))
+        else:
+            content = [{"type": "text", "text": json.dumps(context, default=json_state)}]
+            for name in ("front", "left_wrist", "right_wrist"):
+                image = views.get(name)
+                if isinstance(image, bytes):
+                    image = base64.b64encode(image).decode("ascii")
+                if not isinstance(image, str) or not image:
+                    raise ValueError(f"Missing JPEG observation: {name}")
+                content.extend([
+                    {"type": "text", "text": name},
+                    {"type": "image_url", "image_url": {"url": image if image.startswith("data:image/") else "data:image/jpeg;base64," + image}},
+                ])
+            body = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": content},
+                ],
+            }
+            headers = {"Content-Type": "application/json"}
+            if self.key:
+                headers["Authorization"] = "Bearer " + self.key
+            request = urllib.request.Request(self.url, json.dumps(body).encode(), headers=headers)
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                result = json.load(response)
+            decision = json.loads(result["choices"][0]["message"]["content"])
+
         if not isinstance(decision, dict):
             raise ValueError("Agent must return a JSON object")
         instruction = decision.get("instruction")
@@ -142,7 +196,7 @@ class VisionAgent:
 
 
 class Harness:
-    def __init__(self, upstream_url, headers=None, agent=None, agent_every=4, timeout=60):
+    def __init__(self, upstream_url, headers=None, agent=None, agent_every=4, timeout=60, prompt_ctrl=None):
         if agent_every < 1 or timeout <= 0:
             raise ValueError("agent_every and timeout must be positive")
         self.upstream_url = upstream_url
@@ -150,9 +204,9 @@ class Harness:
         self.agent = agent
         self.agent_every = agent_every
         self.timeout = timeout
+        self.prompt_ctrl = prompt_ctrl
 
     async def handle(self, downstream):
-        # Separate goal and history for each WebUI inference session.
         goal = previous = None
         history = deque(maxlen=8)
         request_index = 0
@@ -176,21 +230,24 @@ class Harness:
                     observation = unpack(frame)
                     validate_request(observation)
                     incoming_goal = instruction_text(observation.get("instruction"))
+                    if self.prompt_ctrl is not None:
+                        incoming_goal, _ = self.prompt_ctrl.get_effective_instruction(incoming_goal)
                     if incoming_goal != goal:
                         goal, previous = incoming_goal, incoming_goal
                         history.clear()
                         request_index = 0
                     if self.agent is not None:
                         if request_index % self.agent_every == 0:
-                            # The blocking HTTP call runs outside the WebSocket event loop.
                             previous = await asyncio.to_thread(
                                 self.agent.decide, observation, goal, previous, history
                             )
                             history.append(previous)
                         observation["instruction"] = previous
                         frame = pack(observation)
+                    elif self.prompt_ctrl is not None and previous != observation.get("instruction"):
+                        observation["instruction"] = previous
+                        frame = pack(observation)
                     await asyncio.wait_for(upstream.send(frame), self.timeout)
-                    # Keep the complete reply, including error/timing fields, unchanged.
                     response = await asyncio.wait_for(upstream.recv(), self.timeout)
                     await asyncio.wait_for(downstream.send(response), self.timeout)
                     print(json.dumps({
@@ -203,7 +260,6 @@ class Harness:
         except ConnectionClosed:
             print("Connection closed; end/confirm the session in WebUI.", flush=True)
         except Exception as error:
-            # Don't print HTTP bodies, credentials, images, or full observations.
             print(f"Harness failed: {type(error).__name__}. Stop the session in WebUI.", flush=True)
             await downstream.close(code=1011, reason="Harness failure; stop in WebUI")
 
@@ -221,10 +277,12 @@ async def main():
         parser.error("WALLX_HEADERS_FILE must contain a JSON object")
     agent = None
     if not args.passthrough:
-        url, model = os.environ.get("AGENT_CHAT_URL"), os.environ.get("AGENT_MODEL")
-        if not url or not model:
-            parser.error("Set AGENT_CHAT_URL and AGENT_MODEL, or use --passthrough")
-        agent = VisionAgent(url, model, os.environ.get("AGENT_API_KEY", ""))
+        url = os.environ.get("AGENT_CHAT_URL", "")
+        model = os.environ.get("AGENT_MODEL", "")
+        key = os.environ.get("AGENT_API_KEY", "") or load_anthropic_api_key()
+        if not url and not key:
+            parser.error("Set ANTHROPIC_API_KEY or AGENT_CHAT_URL + AGENT_MODEL, or use --passthrough")
+        agent = VisionAgent(url, model, key)
     relay = Harness(WALLX_URL, headers, agent=agent, agent_every=args.agent_every)
     async with serve(
         relay.handle, args.host, args.port,

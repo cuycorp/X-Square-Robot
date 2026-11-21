@@ -1,0 +1,37 @@
+{
+  "mode": "benchmark",
+  "task_name": "claude_autonomous_prompt",
+  "model": {
+    "config_name": "claude_autonomous_endpose",
+    "deploy": "lan",
+    "model_address": "ws://10.19.20.98:8001",
+    "robot_type": "DESKTOP",
+    "mode_type": "EndPose",
+    "infer_type": "sync",
+    "infer_params": {
+      "action_horizon": 32,
+      "control_dt": 0.005,
+      "interpolate_multiplier": 8,
+      "async_params": {
+        "api_schema": "public_v2",
+        "embodiment": "quanta_x1_pro/gripper-g",
+        "normalization": "provided",
+        "control_context": "masked"
+      }
+    }
+  },
+  "data": [
+    {
+      "case_id": 1,
+      "instruction": "Pick up the spoon and place it in the bowl.",
+      "image_path": "",
+      "env_description": {
+        "mode": "Prompt-driven autonomous dual-arm EndPose control via Claude Vision"
+      },
+      "scores_dict": {
+        "Task completed safely": 10
+      },
+      "timeout": 180
+    }
+  ]
+}
