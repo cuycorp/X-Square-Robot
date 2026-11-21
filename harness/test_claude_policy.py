@@ -31,7 +31,7 @@ from claude_policy import (
 from harness import VisionAgent
 from protocol import ACTION_HORIZON, ProtocolError, validate_request
 from server import DualArmPolicyEngine, PromptController, serve_connection, start_console_http_server
-from sim_cpu_env import TabletopState, build_observation_payload, run_episode, shift_chunk
+from sim_cpu_env import TabletopState, build_observation_payload, run_episode, shift_chunk, step_physics
 from trajectory import WorkspaceLimits, matrix_to_rpy, rpy_to_matrix, synthesize_arm_chunk
 import launch as launcher
 
@@ -108,7 +108,7 @@ class TestProtocolAndTrajectory(unittest.TestCase):
 class TestClaudePlannerAndHarness(unittest.TestCase):
     def test_claude_endpose_planner_and_completion_hold(self) -> None:
         req = validate_request(build_observation_payload(TabletopState(), "Approach red block"))
-        planner = ClaudeEndPosePlanner(api_key="test-key", model="claude-sonnet-5-5")
+        planner = ClaudeEndPosePlanner(api_key="test-key", model="claude-sonnet-5-5", plan_every=1)
         body = planner.build_request_body(req)
         self.assertEqual(body["model"], "claude-sonnet-5-5")
         self.assertNotIn("temperature", body)
@@ -186,6 +186,79 @@ class TestClaudePlannerAndHarness(unittest.TestCase):
             self.assertEqual(captured_headers[0]["X-api-key"], "test-key")
             self.assertEqual(captured_headers[0]["Anthropic-version"], "2023-06-01")
 
+    def test_waypoints_follow_measured_feedback_in_simulation(self) -> None:
+        state = TabletopState()
+        planner = ClaudeEndPosePlanner(api_key="test-key")
+        engine = DualArmPolicyEngine(planner)
+        req = build_observation_payload(state, "Move the left arm forward and up")
+        targets = ([0.34, 0.14, 0.30], [0.34, 0.14, 0.35])
+        waypoints = [
+            {"left_ee": {"position": target, "rotation_rpy": [0.0, 0.25, 0.0], "gripper": 1.2}}
+            for target in targets
+        ]
+        replies = [
+            {"status": "in_progress", "stage": "approach", "waypoints": waypoints},
+            {"status": "completed", "stage": "done", "waypoints": []},
+        ]
+        with patch.object(planner, "_post_messages", side_effect=[
+            {"content": [{"type": "text", "text": json.dumps(reply)}]} for reply in replies
+        ]) as model:
+            first = engine.handle_payload(req)
+            stalled = engine.handle_payload(req)
+            self.assertEqual(first, stalled)
+            self.assertEqual(engine.prompt_ctrl.snapshot()["waypoint_index"], 1)
+            for index, target in enumerate(targets, 1):
+                if index == 1:
+                    actions = first["actions"]
+                else:
+                    actions = engine.handle_payload(build_observation_payload(state, req["instruction"]))["actions"]
+                self.assertEqual(engine.prompt_ctrl.snapshot()["waypoint_index"], index)
+                self.assertEqual(engine.prompt_ctrl.snapshot()["waypoint_count"], 2)
+                np.testing.assert_allclose(actions["left_ee"]["position"][-1], target)
+                np.testing.assert_allclose(actions["right_ee"]["position"][-1], state.right_pos)
+                for left_p, left_r, left_g, right_p, right_r, right_g in zip(
+                    actions["left_ee"]["position"], actions["left_ee"]["rotation_rpy"], actions["left_ee"]["gripper"],
+                    actions["right_ee"]["position"], actions["right_ee"]["rotation_rpy"], actions["right_ee"]["gripper"],
+                ):
+                    step_physics(state, left_p, left_r, left_g, right_p, right_r, right_g)
+            self.assertEqual(model.call_count, 1)
+            final = engine.handle_payload(build_observation_payload(state, req["instruction"]))
+            summary = json.loads(model.call_args.args[0]["messages"][0]["content"][0]["text"])
+            self.assertEqual(summary["recent_history"][-1]["reached_waypoints"], 2)
+            self.assertEqual(engine.prompt_ctrl.snapshot()["status"], "completed")
+            self.assertEqual(final["actions"]["left_ee"]["position"][-1], list(targets[-1]))
+
+    def test_invalid_waypoint_does_not_execute_a_partial_plan(self) -> None:
+        state = TabletopState()
+        planner = ClaudeEndPosePlanner(api_key="test-key")
+        engine = DualArmPolicyEngine(planner)
+        valid = {"left_ee": {"position": [0.35, 0.14, 0.30], "rotation_rpy": [0, 0.25, 0], "gripper": 1.2}}
+        invalid = {"left_ee": {**valid["left_ee"], "gripper": float("nan")}}
+        reply = {"status": "in_progress", "waypoints": [valid, invalid]}
+        with patch.object(planner, "_post_messages", return_value={
+            "content": [{"type": "text", "text": json.dumps(reply)}]
+        }):
+            actions = engine.handle_payload(build_observation_payload(state, "Move forward"))["actions"]
+        self.assertEqual(engine.prompt_ctrl.snapshot()["stage"], "error_hold")
+        self.assertEqual(actions["left_ee"]["position"][-1], state.left_pos.tolist())
+
+    def test_plan_arriving_after_prompt_change_holds_instead(self) -> None:
+        state = TabletopState()
+        planner = ClaudeEndPosePlanner(api_key="test-key")
+        engine = DualArmPolicyEngine(planner)
+
+        def new_prompt_while_planning(_body: dict[str, Any]) -> dict[str, Any]:
+            engine.prompt_ctrl.set_prompt("Wait")
+            reply = {"status": "in_progress", "waypoints": [
+                {"left_ee": {"position": [0.35, 0.14, 0.30], "rotation_rpy": [0, 0.25, 0], "gripper": 1.2}}
+            ]}
+            return {"content": [{"type": "text", "text": json.dumps(reply)}]}
+
+        with patch.object(planner, "_post_messages", side_effect=new_prompt_while_planning):
+            actions = engine.handle_payload(build_observation_payload(state, "Move forward"))["actions"]
+        self.assertEqual(engine.prompt_ctrl.snapshot()["effective_instruction"], "Wait")
+        self.assertEqual(actions["left_ee"]["position"][-1], state.left_pos.tolist())
+
     def test_claude_auth_error_raises_immediately(self) -> None:
         req = validate_request(build_observation_payload(TabletopState(), "Pick"))
         planner = ClaudeEndPosePlanner(api_key="bad-key")
@@ -193,6 +266,46 @@ class TestClaudePlannerAndHarness(unittest.TestCase):
         with patch("claude_policy.urllib.request.urlopen", side_effect=err):
             with self.assertRaises(AuthError):
                 planner.decide(req)
+
+    def test_local_key_setup_verifies_access_and_enables_prompt(self) -> None:
+        import urllib.request
+        from unittest.mock import MagicMock
+
+        planner = ClaudeEndPosePlanner(model="claude-sonnet-5-5")
+        planner.api_key = ""
+        controller = PromptController()
+        server = start_console_http_server("127.0.0.1", 0, controller, key_planner=planner)
+        origin = f"http://127.0.0.1:{server.server_port}"
+        urlopen = urllib.request.urlopen
+
+        def post(path: str, data: dict[str, str]) -> dict:
+            request = urllib.request.Request(
+                origin + path, data=json.dumps(data).encode(),
+                headers={"Origin": origin, "Content-Type": "application/json"}, method="POST",
+            )
+            with urlopen(request, timeout=2) as response:
+                return json.load(response)
+
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as blocked:
+                post("/api/prompt", {"prompt": "Move the arm"})
+            self.assertEqual(blocked.exception.code, 409)
+            blocked.exception.close()
+            with patch("claude_policy.urllib.request.urlopen", return_value=MagicMock()) as cloud:
+                result = post("/api/anthropic-key", {"key": "test-key"})
+                request = cloud.call_args.args[0]
+                self.assertTrue(request.full_url.endswith("/v1/models/claude-sonnet-5-5"))
+                self.assertEqual(request.get_method(), "GET")
+            self.assertEqual(result, {"key_ready": True})
+            self.assertTrue(post("/api/prompt", {"prompt": "Move the arm"})["ok"])
+            with urlopen(origin + "/api/status", timeout=2) as response:
+                status = json.load(response)
+            self.assertTrue(status["key_ready"])
+            self.assertEqual(status["active_prompt"], "Move the arm")
+            self.assertNotIn("test-key", json.dumps(status))
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_vision_agent_anthropic_mode_in_harness(self) -> None:
         obs = build_observation_payload(TabletopState(), "Place spoon in bowl")

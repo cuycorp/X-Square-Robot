@@ -6,20 +6,24 @@ Uses only Python stdlib urllib.request so it runs in minimal robot environments.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from protocol import ValidatedRequest
+from trajectory import rotation_distance
 
 
 DEFAULT_CLAUDE_KEY_FILE = Path.home() / ".config" / "anthropic" / "api_key"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
+MAX_WAYPOINTS = 3
 
 SYSTEM_PROMPT = """You autonomously control a bimanual desktop robot (quanta_x1_pro) via EndPose targets.
 
@@ -33,26 +37,25 @@ Coordinate frame & camera layout:
 Control guidelines:
 1. Break any natural-language task into smooth sequential stages:
    approach_above -> align_xy -> descend -> grasp (hold position while closing gripper) -> lift -> transport -> place -> release (hold position while opening gripper) -> retreat -> completed.
-2. Keep per-step translation deltas modest (<= 0.08 m) and rotation deltas modest (<= 0.40 rad). Each output commands ~1.0 s (32 frames).
-3. Use visual feedback from all 3 cameras + current EE poses. If a grasp missed (visible gap in wrist camera), set status to "retry" and re-align before lifting.
-4. Use the closer/most appropriate arm (or both arms for bimanual tasks). Keep an idle arm stationary (delta [0, 0, 0]).
-5. Only output status="completed" when the goal is visually satisfied and the object is stably placed/released (or held as requested). Do not claim hardware has powered off; the server will safely hold current pose while waiting for the next prompt or operator stop in WebUI.
+2. Return one to three sequential waypoints for the current stage. Use absolute base-frame positions in meters and RPY in radians. Keep each leg short (roughly <= 0.08 m and <= 0.40 rad), clear of the tabletop, both arms and visible obstacles. Give each arm's full pose and gripper when commanding it. Omit any idle arm.
+3. Use feedback from all three cameras and the measured end-effector poses. Stop the current plan at a point where new visual evidence is required, for example after closing a gripper and before attempting a lift.
+4. If the scene is ambiguous, the path cannot be estimated from the views, or a grasp is uncertain, return status="retry" and an empty waypoints array. Explain what blocked planning.
+5. Return status="completed" with an empty waypoints array only when fresh observations show the task goal is satisfied. The controller will hold the measured pose.
 
 Respond strictly with ONE valid JSON object (no markdown fences or commentary):
 {
   "stage": "short_stage_label",
   "status": "in_progress | completed | retry",
   "reason": "brief observation-grounded explanation",
-  "left_ee": {
-    "delta_position": [dx, dy, dz],
-    "delta_rpy": [droll, dpitch, dyaw],
-    "gripper": 1.2
-  },
-  "right_ee": {
-    "delta_position": [dx, dy, dz],
-    "delta_rpy": [droll, dpitch, dyaw],
-    "gripper": 1.2
-  }
+  "waypoints": [
+    {
+      "left_ee": {
+        "position": [x, y, z],
+        "rotation_rpy": [roll, pitch, yaw],
+        "gripper": 1.2
+      }
+    }
+  ]
 }"""
 
 
@@ -72,6 +75,8 @@ class PlannerDecision:
     right_target_rpy: list[float]
     right_gripper: float
     raw_json: dict[str, Any] = field(default_factory=dict)
+    waypoint_index: int | None = None
+    waypoint_count: int = 0
 
 
 def load_anthropic_api_key(explicit_key: str | None = None) -> str:
@@ -105,7 +110,42 @@ def extract_json_object(text: str) -> dict[str, Any]:
         brace = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if brace:
             cleaned = brace.group(0)
-    return json.loads(cleaned)
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("Claude response must be a JSON object")
+    return parsed
+
+
+def _finite_number(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError("Pose values must be finite numbers")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError("Pose values must be finite numbers")
+    return result
+
+
+def _validated_waypoints(parsed: dict[str, Any], gripper_range: tuple[float, float]) -> list[dict[str, Any]]:
+    waypoints = parsed["waypoints"]
+    if not isinstance(waypoints, list) or not 1 <= len(waypoints) <= MAX_WAYPOINTS:
+        raise ValueError(f"Expected 1 to {MAX_WAYPOINTS} waypoints")
+    lo, hi = gripper_range
+    for point in waypoints:
+        if not isinstance(point, dict) or not point or set(point) - {"left_ee", "right_ee"}:
+            raise ValueError("A waypoint must specify at least one arm")
+        for arm in point.values():
+            if not isinstance(arm, dict) or set(arm) != {"position", "rotation_rpy", "gripper"}:
+                raise ValueError("A waypoint arm needs position, rotation_rpy and gripper")
+            for field_name in ("position", "rotation_rpy"):
+                values = arm[field_name]
+                if not isinstance(values, list) or len(values) != 3:
+                    raise ValueError(f"{field_name} must have three components")
+                arm[field_name] = [_finite_number(value) for value in values]
+            gripper = _finite_number(arm["gripper"])
+            if not lo <= gripper <= hi:
+                raise ValueError("Waypoint gripper is outside the configured range")
+            arm["gripper"] = gripper
+    return waypoints
 
 
 def _apply_arm_command(
@@ -119,24 +159,24 @@ def _apply_arm_command(
         return list(current_pos), list(current_rpy), float(current_grip)
 
     if "position" in cmd and isinstance(cmd["position"], (list, tuple)) and len(cmd["position"]) == 3:
-        tgt_pos = [float(cmd["position"][i]) for i in range(3)]
+        tgt_pos = [_finite_number(value) for value in cmd["position"]]
     else:
         dp = cmd.get("delta_position", [0.0, 0.0, 0.0])
         if not isinstance(dp, (list, tuple)) or len(dp) != 3:
             dp = [0.0, 0.0, 0.0]
-        tgt_pos = [float(current_pos[i]) + float(dp[i]) for i in range(3)]
+        tgt_pos = [_finite_number(current + _finite_number(delta)) for current, delta in zip(current_pos, dp)]
 
     if "rotation_rpy" in cmd and isinstance(cmd["rotation_rpy"], (list, tuple)) and len(cmd["rotation_rpy"]) == 3:
-        tgt_rpy = [float(cmd["rotation_rpy"][i]) for i in range(3)]
+        tgt_rpy = [_finite_number(value) for value in cmd["rotation_rpy"]]
     else:
         dr = cmd.get("delta_rpy", [0.0, 0.0, 0.0])
         if not isinstance(dr, (list, tuple)) or len(dr) != 3:
             dr = [0.0, 0.0, 0.0]
-        tgt_rpy = [float(current_rpy[i]) + float(dr[i]) for i in range(3)]
+        tgt_rpy = [_finite_number(current + _finite_number(delta)) for current, delta in zip(current_rpy, dr)]
 
     lo, hi = gripper_range
     g_raw = cmd.get("gripper", current_grip)
-    tgt_grip = max(lo, min(hi, float(g_raw)))
+    tgt_grip = max(lo, min(hi, _finite_number(g_raw)))
     return tgt_pos, tgt_rpy, tgt_grip
 
 
@@ -190,6 +230,20 @@ def _state_summary(req: ValidatedRequest, history: list[dict[str, Any]]) -> str:
     )
 
 
+def _reached_waypoint(req: ValidatedRequest, decision: PlannerDecision) -> bool:
+    grip_tolerance = 0.02 * (req.gripper_range[1] - req.gripper_range[0])
+    arms = (
+        (req.left_ee, decision.left_target_pos, decision.left_target_rpy, decision.left_gripper),
+        (req.right_ee, decision.right_target_pos, decision.right_target_rpy, decision.right_gripper),
+    )
+    return all(
+        math.dist(arm.position, pos) <= 0.01
+        and rotation_distance(arm.rotation_rpy, rpy) <= 0.05
+        and abs(arm.gripper - grip) <= grip_tolerance
+        for arm, pos, rpy, grip in arms
+    )
+
+
 def hold_pose_decision(req: ValidatedRequest, stage: str = "hold", status: str = "completed", reason: str = "") -> PlannerDecision:
     return PlannerDecision(
         stage=stage,
@@ -213,7 +267,7 @@ class ClaudeEndPosePlanner:
         base_url: str | None = None,
         model: str | None = None,
         timeout_s: float = 25.0,
-        plan_every: int = 1,
+        plan_every: int = 4,
     ) -> None:
         self.api_key = load_anthropic_api_key(api_key)
         self.base_url = (base_url or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
@@ -224,12 +278,45 @@ class ClaudeEndPosePlanner:
         self.history: list[dict[str, Any]] = []
         self._cached_decision: PlannerDecision | None = None
         self._active_goal: str | None = None
+        self._plan_step = 0
+        self._plan: dict[str, Any] = {}
+        self._waypoints: list[dict[str, Any]] = []
+        self._waypoint_index = 0
+
+    def configure_api_key(self, key: str) -> None:
+        """Check model access with a metadata request before accepting the session key."""
+        key = key.strip()
+        if not key or len(key) > 512 or any(character.isspace() for character in key):
+            raise ValueError("Enter a valid Anthropic API key.")
+        model = urllib.parse.quote(self.model, safe="")
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/models/{model}",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=min(self.timeout_s, 8)):
+                pass
+        except urllib.error.HTTPError as error:
+            raise ValueError(f"Anthropic couldn't verify model access (HTTP {error.code}).") from error
+        except OSError as error:
+            raise RuntimeError("Could not reach the Anthropic API to verify the key.") from error
+        self.api_key = key
 
     def reset_for_goal(self, goal: str) -> None:
         self._active_goal = goal
         self.step_count = 0
         self.history.clear()
         self._cached_decision = None
+        self._plan_step = 0
+        self._waypoints.clear()
+        self._plan.clear()
+        self._waypoint_index = 0
+
+    def _waypoint_decision(self, req: ValidatedRequest) -> PlannerDecision:
+        decision = _decision_from_parsed(req, {**self._plan, **self._waypoints[self._waypoint_index]})
+        decision.waypoint_index = self._waypoint_index + 1
+        decision.waypoint_count = len(self._waypoints)
+        return decision
 
     def build_request_body(self, req: ValidatedRequest) -> dict[str, Any]:
         # Claude 5.5 omits temperature, budget_tokens, and assistant prefill.
@@ -253,7 +340,7 @@ class ClaudeEndPosePlanner:
         ]
         return {
             "model": self.model,
-            "max_tokens": 512,
+            "max_tokens": 1024,
             "system": SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": content}],
         }
@@ -304,27 +391,58 @@ class ClaudeEndPosePlanner:
             )
 
         self.step_count += 1
-        if self._cached_decision is not None and (self.step_count - 1) % self.plan_every != 0:
-            return self._cached_decision
+        if self.step_count - self._plan_step < self.plan_every:
+            if self._waypoints:
+                while self._waypoint_index < len(self._waypoints):
+                    decision = self._waypoint_decision(req)
+                    if not _reached_waypoint(req, decision):
+                        return decision
+                    self.history[-1]["reached_waypoints"] = decision.waypoint_index
+                    self._waypoint_index += 1
+            elif self._cached_decision is not None and self._cached_decision.status == "in_progress":
+                return self._cached_decision
+
+        # Check the active waypoint against the latest observation even when the
+        # replanning interval has expired.
+        if self._waypoint_index < len(self._waypoints):
+            decision = self._waypoint_decision(req)
+            if _reached_waypoint(req, decision):
+                self.history[-1]["reached_waypoints"] = decision.waypoint_index
+        self._cached_decision = None
+        self._waypoints.clear()
+        self._waypoint_index = 0
 
         if not self.api_key:
             raise AuthError("ANTHROPIC_API_KEY is not set.")
 
         body = self._post_messages(self.build_request_body(req))
-        if body.get("stop_reason") == "refusal":
-            raise RuntimeError("Claude refused request")
+        if body.get("stop_reason") in {"refusal", "max_tokens"}:
+            raise RuntimeError("Claude did not return a complete plan")
 
         text_parts = [blk.get("text", "") for blk in body.get("content", []) if blk.get("type") == "text"]
         parsed = extract_json_object("\n".join(text_parts))
-        decision = _decision_from_parsed(req, parsed)
-        if decision.status == "completed":
-            decision = hold_pose_decision(req, stage=decision.stage, status="completed", reason=decision.reason)
+        status = parsed.get("status", "in_progress")
+        if status in ("completed", "retry"):
+            decision = hold_pose_decision(
+                req, stage=str(parsed.get("stage", "hold")), status=status, reason=str(parsed.get("reason", ""))
+            )
+        elif status == "in_progress" and "waypoints" in parsed:
+            self._waypoints = _validated_waypoints(parsed, req.gripper_range)
+            self._plan = {key: parsed[key] for key in ("stage", "status", "reason") if key in parsed}
+            decision = self._waypoint_decision(req)
+        elif status == "in_progress" and any(arm in parsed for arm in ("left_ee", "right_ee")):
+            decision = _decision_from_parsed(req, parsed)
+        else:
+            raise ValueError("Claude returned an invalid plan status or no arm targets")
+        self._plan_step = self.step_count
         self.history.append(
             {
                 "step": self.step_count,
                 "stage": decision.stage,
                 "status": decision.status,
                 "reason": decision.reason,
+                "reached_waypoints": 0,
+                "planned_waypoints": decision.waypoint_count,
             }
         )
         self._cached_decision = decision

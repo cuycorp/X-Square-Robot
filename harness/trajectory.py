@@ -57,6 +57,12 @@ def matrix_to_rpy(r: np.ndarray) -> list[float]:
     return [roll, pitch, yaw]
 
 
+def rotation_distance(first_rpy: list[float], second_rpy: list[float]) -> float:
+    relative = rpy_to_matrix(first_rpy).T @ rpy_to_matrix(second_rpy)
+    cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
+    return math.acos(cosine)
+
+
 def _skew(v: np.ndarray) -> np.ndarray:
     return np.array(
         [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]],

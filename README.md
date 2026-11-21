@@ -24,6 +24,44 @@ Autonomous natural-language control for the `quanta_x1_pro` dual-arm desktop rob
    - Click **Start Evaluation Inference Mode**.
 5. Type new task prompts anytime in the terminal (`prompt> ...`) or in the browser Prompt & Camera Console (`http://<LAN_IP>:8002/`).
 
+## Live cameras
+
+In the Prompt & Camera Console, enter the robot's rosbridge URL, for example `ws://192.168.77.2:9090/` on the wired hackathon setup, and click **Connect**. The front camera and both numbered camera feeds appear side by side.
+
+The camera preview works before inference starts. Each compressed image subscription requests up to 2.5 frames per second. **Disconnect** closes the telemetry connection. **Inference details** shows the separate frames used by the planner once it receives observations.
+
+## Claude zero-shot planning
+
+In Claude mode (`launch.py --mode claude`), enter a task in **Claude Zero-Shot Task** and click **Run Zero-Shot Prompt**. The planner begins processing it when evaluation inference is active in the robot WebUI. The policy receives three camera observations and measured arm poses from the robot client. Claude proposes up to three short Cartesian waypoints for the current stage. The policy generates a bounded pose trajectory toward one waypoint at a time, checks the measured pose before advancing, and replans when the sequence ends or after four observation chunks by default. The console shows the active stage and waypoint. Use `--plan-every` to change the replanning interval.
+
+End the manual SDK session before starting the Claude policy. Claude mode requires an Anthropic API key on the machine running the launcher. The robot WebUI task must point to the policy WebSocket (port `8001` by default), and the browser prompt belongs in the policy console (port `8002` by default).
+
+For a laptop-only key setup page on port 8004, use the following command for the wired station. The policy listens on the laptop's Ethernet address and accepts WebSocket sessions only from the assigned robot.
+
+```bash
+python harness/server.py --mode claude --host 192.168.77.10 --port 8001 --robot-ip 192.168.77.2 --console-host 127.0.0.1 --console-port 8004 --local-key-setup
+```
+
+Open `http://127.0.0.1:8004/`, verify an Anthropic API key, and enter a prompt. The key is kept in the policy server's memory. Click **Release Manual Control** in the manual console, wait for the robot to show idle, then select the task pointing to `ws://192.168.77.10:8001` in the robot WebUI and start evaluation. The policy refuses evaluation sessions until the key and a laptop prompt are set.
+
+Workspace and step limits bound the generated trajectories. Collision and reachability checks depend on the downstream robot controller and its configuration. Claude mode sends inference camera observations to the configured Anthropic API endpoint.
+
+## Joint angles and kinematics
+
+Connecting to rosbridge also displays the measured angles for six joints on each arm. **Advanced IK** opens the pose preview, which uses the robot model from `/robot_description` and joint angles from `/joint_states`. Choose an arm and click **Use Current Pose** to start from its measured gripper-base pose, or enter a target in `base_link`. **Calculate IK** displays a joint solution and its pose residual when the solver converges.
+
+The preview enforces the URDF joint limits and sends no robot commands. It performs a kinematic calculation without collision checks.
+
+### Incremental jogging
+
+**Incremental Jog** has +/- buttons for X, Y, Z, Rx, Ry, Rz and J1–J6. Cartesian buttons use the same URDF solver to move the gripper base in the robot's `base_link` frame. Joint buttons change one joint target. Each click uses the latest measurements and the selected step size.
+
+Run `python harness/jog_console.py` for a local preview. Connect to rosbridge as above to calculate targets without writing to the robot.
+
+For physical jogging on an assigned, idle Desktop station, install the [X Square Desktop SDK](https://github.com/X-Square-Robot/sdk_robot/tree/main/samples/desktop) on a supported Linux host. Stop evaluation inference and other motion controllers before starting the manual session. Run `python harness/jog_console.py --sdk-address HOST:PORT --urdf STATION.urdf` with the station's matching URDF. This starts a separate localhost console and selects SDK joint-position mode. Each accepted click uses fresh SDK feedback and sends one joint target. The jog solver limits increments and joint angles. It does not check the scene for collisions.
+
+In the live manual console, use the left or right arm panel to home that arm or open and close its gripper. Homing uses the SDK reset. The gripper buttons use that gripper's limits from the station URDF. The joint table shows both measured gripper angles.
+
 ## Safety
 
 - Never start another ROS2 control node (`start_desktop.sh` or `infer_with_dispatcher`) while the robot stack is already running.

@@ -286,7 +286,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8001, help="WebSocket policy server port")
     parser.add_argument("--console-port", type=int, default=8002, help="Browser Prompt & Camera Console port (0 to disable)")
     parser.add_argument("--gripper", choices=("g", "h"), default="g", help="Physical gripper type (g or h)")
-    parser.add_argument("--plan-every", type=int, default=1, help="Call Claude every N chunks")
+    parser.add_argument("--plan-every", type=int, default=4, help="Maximum observation chunks between Claude plans")
     parser.add_argument("--max-step-m", type=float, default=0.08, help="Max EndPose translation step per chunk (meters)")
     parser.add_argument("--max-step-rad", type=float, default=0.45, help="Max EndPose rotation step per chunk (radians)")
     parser.add_argument("--no-deploy", action="store_true", help="Do not copy task JSON to /home/xr/diversity")
