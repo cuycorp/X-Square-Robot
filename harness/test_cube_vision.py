@@ -451,5 +451,86 @@ class TestCubeRegressionRealStation(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_correlate_all_three_cameras_and_table_turn_autofill(self) -> None:
+        # Simulate front (U + F), cam1 (U + occluded F), cam3 (rotated U + R), then 180-deg table turn (B + L)
+        u_grid = [["O", "O", "B"], ["O", "O", "Y"], ["O", "R", "O"]]
+        f_grid = [["B", "G", "Y"], ["B", "B", "B"], ["B", "B", "Y"]]
+        r_grid = [["G", "G", "Y"], ["W", "Y", "R"], ["W", "B", "G"]]
+        b_grid = [["W", "R", "G"], ["Y", "G", "O"], ["B", "W", "R"]]
+        l_grid = [["Y", "B", "W"], ["R", "W", "G"], ["O", "Y", "B"]]
+
+        img_front = img_to_b64(render_isometric_two_face_cube(u_grid, f_grid, occlude_front_bottom=False))
+        img_cam1 = img_to_b64(render_isometric_two_face_cube(u_grid, f_grid, occlude_front_bottom=True))
+        img_cam3 = img_to_b64(render_isometric_two_face_cube(rotate_grid_cw(u_grid, 1), r_grid, occlude_front_bottom=False))
+
+        ctrl = PromptController("Correlate cube")
+        srv = start_console_http_server("127.0.0.1", 0, ctrl)
+        origin = f"http://127.0.0.1:{srv.server_port}"
+
+        def post(path: str, data: dict[str, Any]) -> dict[str, Any]:
+            req = urllib.request.Request(
+                origin + path,
+                data=json.dumps(data).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return json.load(resp)
+
+        try:
+            res = post("/api/cube/correlate", {
+                "images_b64": {
+                    "/camera_head_front/color/image_raw/compressed": img_front,
+                    "/camera1/usb_cam1/image_raw/image_compressed": img_cam1,
+                    "/camera3/usb_cam3/image_raw/image_compressed": img_cam3,
+                },
+                "auto_fill": True,
+            })
+            st = res["state"]
+            self.assertEqual(sorted(res["correlation"]["correlated_faces"]), ["F", "R", "U"])
+            self.assertEqual(st["faces"]["U"]["grid"], u_grid)
+            self.assertEqual(st["faces"]["F"]["grid"], f_grid)
+            self.assertEqual(st["faces"]["R"]["grid"], r_grid)
+            self.assertEqual(len(st["faces"]["U"]["sources"]), 3)
+            self.assertEqual(st["validation"]["known_stickers"], 27)
+            # cam3 overlay side face must be canonically labeled R
+            cam3_vfs = st["live_by_source"]["/camera3/usb_cam3/image_raw/image_compressed"]["visible_faces"]
+            self.assertEqual(cam3_vfs[1].get("canonical_face"), "R")
+
+            # Turn the physical cube 180 deg on the table: front now sees B, cam3 now sees L
+            img_front_180 = img_to_b64(render_isometric_two_face_cube(rotate_grid_cw(u_grid, 2), b_grid, occlude_front_bottom=False))
+            img_cam3_180 = img_to_b64(render_isometric_two_face_cube(rotate_grid_cw(u_grid, 3), l_grid, occlude_front_bottom=False))
+            res2 = post("/api/cube/correlate", {
+                "images_b64": {
+                    "/camera_head_front/color/image_raw/compressed": img_front_180,
+                    "/camera1/usb_cam1/image_raw/image_compressed": img_front_180,
+                    "/camera3/usb_cam3/image_raw/image_compressed": img_cam3_180,
+                },
+                "auto_fill": True,
+            })
+            st2 = res2["state"]
+            self.assertEqual(st2["faces"]["U"]["grid"], u_grid)
+            self.assertEqual(st2["faces"]["F"]["grid"], f_grid)
+            self.assertEqual(st2["faces"]["R"]["grid"], r_grid)
+            self.assertEqual(st2["faces"]["B"]["grid"], b_grid)
+            self.assertEqual(st2["faces"]["L"]["grid"], l_grid)
+            self.assertEqual(st2["validation"]["known_stickers"], 45)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # Verify passive DualArmPolicyEngine inference also correlates front + right_wrist + left_wrist
+        ctrl3 = PromptController("Hold")
+        engine = DualArmPolicyEngine(planner=HeuristicOfflinePlanner(), prompt_ctrl=ctrl3)
+        payload = build_observation_payload(TabletopState(), "Hold")
+        payload["observation"]["images"]["front"] = img_front
+        payload["observation"]["images"]["right_wrist"] = img_cam1
+        payload["observation"]["images"]["left_wrist"] = img_cam3
+        engine.handle_payload(payload)
+        snap3 = ctrl3.cube_state.snapshot()
+        self.assertEqual(snap3["faces"]["U"]["grid"], u_grid)
+        self.assertEqual(snap3["faces"]["F"]["grid"], f_grid)
+        self.assertEqual(snap3["faces"]["R"]["grid"], r_grid)
+
 if __name__ == "__main__":
     unittest.main()

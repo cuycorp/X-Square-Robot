@@ -1,4 +1,4 @@
-"""Canonical 6-face 3D Rubik's cube state accumulator and validator."""
+"""Canonical 6-face 3D Rubik's cube state accumulator, validator, and multi-camera correlator."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any
 
 FACES = ("U", "R", "F", "D", "L", "B")
 AUTO_FACE_ORDER = ("F", "R", "U", "L", "B", "D")
+SIDE_RING = ("F", "R", "B", "L")
 VALID_COLORS = ("W", "Y", "R", "O", "B", "G")
 UNKNOWN = "?"
 
@@ -51,8 +52,73 @@ def normalize_grid(grid: Any) -> list[list[str]]:
     return out
 
 
+def _source_role(source: str) -> str:
+    s = str(source or "").lower()
+    if "front" in s or "head" in s:
+        return "front"
+    if "camera1" in s or "cam1" in s or "right_wrist" in s:
+        return "cam1"
+    if "camera3" in s or "cam3" in s or "left_wrist" in s:
+        return "cam3"
+    return s
+
+
+def _source_priority(source: str) -> int:
+    role = _source_role(source)
+    if role == "front":
+        return 0
+    if role == "cam1":
+        return 1
+    if role == "cam3":
+        return 2
+    return 3
+
+
+def _default_u_rotation_for_role(role: str) -> int:
+    # Left wrist camera (cam3) views across from the right (+90 deg CW on U relative to front).
+    if role == "cam3":
+        return 1
+    return 0
+
+
+def _best_u_rotation(u_ref: list[list[str]], u_obs: list[list[str]], fallback_rot: int = 0) -> tuple[int, int, int]:
+    """Return (k_cw, matches, mismatches) such that rotate_grid_cw(u_ref, k_cw) ~= u_obs."""
+    best_k = fallback_rot % 4
+    best_score = (-1, 99, -1)
+    best_stats = (0, 0)
+    ties: list[tuple[int, int, int]] = []
+    for k in range(4):
+        cand = rotate_grid_cw(u_ref, k)
+        matches = 0
+        mismatches = 0
+        for r in range(3):
+            for c in range(3):
+                a, b = cand[r][c], u_obs[r][c]
+                if a != UNKNOWN and b != UNKNOWN:
+                    if a == b:
+                        matches += 1
+                    else:
+                        mismatches += 1
+        score = (matches - 2 * mismatches, -mismatches, 1 if k == (fallback_rot % 4) else 0)
+        if score[:2] > best_score[:2]:
+            best_score = score
+            best_k = k
+            best_stats = (matches, mismatches)
+            ties = [(k, matches, mismatches)]
+        elif score[:2] == best_score[:2]:
+            ties.append((k, matches, mismatches))
+            if k == (fallback_rot % 4):
+                best_k = k
+                best_stats = (matches, mismatches)
+    if len(ties) > 1:
+        for k, m, mm in ties:
+            if k == (fallback_rot % 4):
+                return k, m, mm
+    return best_k, best_stats[0], best_stats[1]
+
+
 class CubeStateManager:
-    """Thread-safe 3D Rubik's cube state tracker for live detection and multi-side scanning."""
+    """Thread-safe 3D Rubik's cube state tracker and multi-camera correlator."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -72,6 +138,13 @@ class CubeStateManager:
             "updated_at": None,
         }
         self._live_by_source: dict[str, dict[str, Any]] = {}
+        self._correlation: dict[str, Any] = {
+            "active_cameras": [],
+            "camera_mappings": {},
+            "correlated_faces": [],
+            "total_known_stickers": 0,
+            "updated_at": None,
+        }
         self._reset_faces_locked()
 
     def _reset_faces_locked(self) -> None:
@@ -80,17 +153,33 @@ class CubeStateManager:
                 "grid": empty_grid(),
                 "scanned": False,
                 "source": "",
+                "sources": [],
+                "mode": "",
                 "confidence": 0.0,
                 "updated_at": None,
             }
             for face in FACES
+        }
+        self._correlation = {
+            "active_cameras": [],
+            "camera_mappings": {},
+            "correlated_faces": [],
+            "total_known_stickers": 0,
+            "updated_at": None,
         }
 
     def reset(self) -> None:
         with self._lock:
             self._reset_faces_locked()
 
-    def update_live(self, detection: dict[str, Any], source: str = "") -> None:
+    def update_live(
+        self,
+        detection: dict[str, Any],
+        source: str = "",
+        *,
+        auto_correlate: bool = False,
+        auto_fill: bool = True,
+    ) -> None:
         src = source or str(detection.get("source", ""))
         entry = {
             "detected": bool(detection.get("detected", False)),
@@ -121,6 +210,263 @@ class CubeStateManager:
             )
             if not keep_active_other:
                 self._live = entry
+            if auto_correlate:
+                self._correlate_multicam_locked(auto_fill=auto_fill)
+
+    def correlate_multicam(self, *, auto_fill: bool = True) -> dict[str, Any]:
+        with self._lock:
+            corr = self._correlate_multicam_locked(auto_fill=auto_fill)
+            return {
+                "correlation": copy.deepcopy(corr),
+                "state": self._snapshot_locked(),
+            }
+
+    def _correlate_multicam_locked(self, *, auto_fill: bool = True) -> dict[str, Any]:
+        now = time.time()
+        # Use all active detected cameras (recent within 12s, or all detected in offline/test snapshots).
+        active: list[tuple[str, dict[str, Any]]] = []
+        for src, det in self._live_by_source.items():
+            if not det.get("detected"):
+                continue
+            ts = float(det.get("updated_at") or now)
+            if (now - ts) <= 12.0:
+                active.append((src, det))
+        if not active and self._live.get("detected"):
+            src = str(self._live.get("source") or "live")
+            active.append((src, self._live))
+
+        if not active:
+            self._correlation = {
+                "active_cameras": [],
+                "camera_mappings": {},
+                "correlated_faces": [],
+                "total_known_stickers": 0,
+                "updated_at": now,
+            }
+            return self._correlation
+
+        active.sort(key=lambda item: (_source_priority(item[0]), -int(item[1].get("total_known_stickers", 0))))
+
+        # Extract normalized visible_faces list per camera.
+        cam_faces: dict[str, list[dict[str, Any]]] = {}
+        for src, det in active:
+            vfs = det.get("visible_faces") or []
+            if not vfs and det.get("grid"):
+                vfs = [{
+                    "face": "F",
+                    "grid": det["grid"],
+                    "confidence": det.get("confidence", 0.0),
+                    "known_stickers": sum(1 for r in det["grid"] for c in r if c != UNKNOWN),
+                }]
+            cam_faces[src] = vfs
+
+        # Establish canonical U reference from the highest-priority camera seeing U, or stored U.
+        anchor_src = None
+        anchor_u: list[list[str]] | None = None
+        for src, _det in active:
+            for vf in cam_faces[src]:
+                if vf.get("face") == "U":
+                    g = normalize_grid(vf.get("grid"))
+                    if sum(1 for r in g for c in r if c != UNKNOWN) >= 5:
+                        anchor_src = src
+                        anchor_u = g
+                        break
+            if anchor_u is not None:
+                break
+
+        k_table = 0
+        stored_u = self._faces["U"]["grid"] if self._faces["U"]["scanned"] else None
+        if anchor_u is not None and anchor_src is not None:
+            anchor_role = _source_role(anchor_src)
+            anchor_default = _default_u_rotation_for_role(anchor_role)
+            if anchor_default != 0:
+                anchor_u = rotate_grid_cw(anchor_u, (4 - anchor_default) % 4)
+            # Check whether the physical cube was turned horizontally on the table vs already stored U.
+            if stored_u is not None:
+                u_distinct = {c for row in stored_u for c in row if c != UNKNOWN}
+                if len(u_distinct) >= 2:
+                    k_best, m_best, mm_best = _best_u_rotation(stored_u, anchor_u, fallback_rot=0)
+                    if m_best >= 6 and mm_best <= 1:
+                        k_table = k_best
+                        anchor_u = rotate_grid_cw(anchor_u, (4 - k_table) % 4)
+                    elif stored_u[1][1] != anchor_u[1][1] and self._faces["U"].get("mode") == "auto":
+                        # Cube was flipped onto a different top face; clear stale auto faces.
+                        for fkey in FACES:
+                            if self._faces[fkey].get("mode") == "auto":
+                                self._faces[fkey] = {
+                                    "grid": empty_grid(),
+                                    "scanned": False,
+                                    "source": "",
+                                    "sources": [],
+                                    "mode": "",
+                                    "confidence": 0.0,
+                                    "updated_at": None,
+                                }
+        elif stored_u is not None:
+            anchor_u = [list(row) for row in stored_u]
+
+        # Votes per canonical face -> (r, c) -> color -> total_weight
+        votes: dict[str, list[list[dict[str, float]]]] = {
+            f: [[{} for _ in range(3)] for _ in range(3)] for f in FACES
+        }
+        face_sources: dict[str, list[str]] = {f: [] for f in FACES}
+        face_confs: dict[str, list[float]] = {f: [] for f in FACES}
+        camera_mappings: dict[str, Any] = {}
+
+        for src, det in active:
+            role = _source_role(src)
+            vfs = cam_faces[src]
+            u_vf = next((vf for vf in vfs if vf.get("face") == "U"), None)
+            side_vfs = [vf for vf in vfs if vf.get("face") != "U"]
+
+            k_cam_rel = _default_u_rotation_for_role(role)
+            if u_vf is not None and anchor_u is not None:
+                u_obs = normalize_grid(u_vf.get("grid"))
+                u_distinct = {c for row in anchor_u for c in row if c != UNKNOWN}
+                if len(u_distinct) >= 2:
+                    k_fit, m_fit, mm_fit = _best_u_rotation(anchor_u, u_obs, fallback_rot=(k_table + k_cam_rel) % 4)
+                    if m_fit >= 4 and mm_fit <= 1:
+                        k_total = k_fit
+                    else:
+                        k_total = (k_table + k_cam_rel) % 4
+                else:
+                    k_total = (k_table + k_cam_rel) % 4
+            else:
+                k_total = (k_table + k_cam_rel) % 4
+
+            per_src_map: dict[str, str] = {}
+            # Annotate live_by_source[src] visible_faces with canonical_face for UI overlays
+            live_vfs = self._live_by_source.get(src, {}).get("visible_faces") or []
+
+            if u_vf is not None:
+                u_obs = normalize_grid(u_vf.get("grid"))
+                u_canon = rotate_grid_cw(u_obs, (4 - k_total) % 4)
+                known_u = sum(1 for r in u_canon for c in r if c != UNKNOWN)
+                conf_u = float(u_vf.get("confidence", det.get("confidence", 0.5)))
+                weight_u = max(0.2, conf_u) * (1.0 + 0.25 * known_u / 9.0) * (1.15 if role == "front" else 1.0)
+                for r in range(3):
+                    for c in range(3):
+                        col = u_canon[r][c]
+                        if col != UNKNOWN:
+                            votes["U"][r][c][col] = votes["U"][r][c].get(col, 0.0) + weight_u
+                if src not in face_sources["U"]:
+                    face_sources["U"].append(src)
+                face_confs["U"].append(conf_u)
+                per_src_map["U"] = "U"
+                for lvf in live_vfs:
+                    if lvf.get("face") == "U":
+                        lvf["canonical_face"] = "U"
+                        lvf["rotation_cw"] = k_total
+
+            for s_idx, svf in enumerate(side_vfs):
+                local_face = str(svf.get("face") or "F")
+                if len(vfs) == 1:
+                    # Single-face view without U: match by center color if known, else F.
+                    s_grid = normalize_grid(svf.get("grid"))
+                    canon_face = self._pick_face_by_center_locked(s_grid[1][1], preferred=local_face if local_face in FACES else "F")
+                else:
+                    offset = 1 if local_face == "R" else (3 if local_face == "L" else s_idx)
+                    canon_face = SIDE_RING[(k_total + offset) % 4]
+                s_grid = normalize_grid(svf.get("grid"))
+                known_s = sum(1 for r in s_grid for c in r if c != UNKNOWN)
+                if known_s == 0:
+                    continue
+                conf_s = float(svf.get("confidence", det.get("confidence", 0.5)))
+                weight_s = max(0.2, conf_s) * (1.0 + 0.25 * known_s / 9.0) * (1.15 if role == "front" else 1.0)
+                for r in range(3):
+                    for c in range(3):
+                        col = s_grid[r][c]
+                        if col != UNKNOWN:
+                            votes[canon_face][r][c][col] = votes[canon_face][r][c].get(col, 0.0) + weight_s
+                if src not in face_sources[canon_face]:
+                    face_sources[canon_face].append(src)
+                face_confs[canon_face].append(conf_s)
+                per_src_map[local_face] = canon_face
+                for lvf in live_vfs:
+                    if lvf.get("face") == local_face:
+                        lvf["canonical_face"] = canon_face
+
+            camera_mappings[src] = {
+                "role": role,
+                "u_rot_cw": k_total,
+                "faces": per_src_map,
+            }
+
+        correlated_faces: list[str] = []
+        for fkey in FACES:
+            if not face_sources[fkey]:
+                continue
+            voted_grid = empty_grid()
+            voted_known = 0
+            for r in range(3):
+                for c in range(3):
+                    cell_votes = votes[fkey][r][c]
+                    if cell_votes:
+                        voted_grid[r][c] = max(cell_votes.items(), key=lambda kv: kv[1])[0]
+                        voted_known += 1
+            if voted_known == 0:
+                continue
+            correlated_faces.append(fkey)
+
+            if auto_fill:
+                cur_face = self._faces[fkey]
+                cur_mode = cur_face.get("mode", "")
+                if cur_mode in ("manual", "claude"):
+                    # Do not overwrite manually captured/edited or Claude-verified cells; only fill '?' if empty.
+                    merged = [list(row) for row in cur_face["grid"]]
+                    changed = False
+                    for r in range(3):
+                        for c in range(3):
+                            if merged[r][c] == UNKNOWN and voted_grid[r][c] != UNKNOWN:
+                                merged[r][c] = voted_grid[r][c]
+                                changed = True
+                    if changed:
+                        cur_face["grid"] = merged
+                        cur_face["sources"] = sorted(set(cur_face.get("sources", []) + face_sources[fkey]))
+                        cur_face["updated_at"] = now
+                    continue
+
+                # Merge with prior auto observations on the same face (if center compatible) so temporary occlusions don't drop stickers.
+                prior_grid = cur_face["grid"]
+                prior_center = prior_grid[1][1]
+                new_center = voted_grid[1][1]
+                same_face_identity = (
+                    not cur_face["scanned"]
+                    or prior_center == UNKNOWN
+                    or new_center == UNKNOWN
+                    or prior_center == new_center
+                )
+                merged_grid = empty_grid()
+                for r in range(3):
+                    for c in range(3):
+                        if voted_grid[r][c] != UNKNOWN:
+                            merged_grid[r][c] = voted_grid[r][c]
+                        elif same_face_identity and prior_grid[r][c] != UNKNOWN:
+                            merged_grid[r][c] = prior_grid[r][c]
+                merged_known = sum(1 for r in merged_grid for c in r if c != UNKNOWN)
+                avg_conf = sum(face_confs[fkey]) / max(1, len(face_confs[fkey]))
+                eff_conf = round(avg_conf * (0.5 + 0.5 * (merged_known / 9.0)), 3)
+                self._faces[fkey] = {
+                    "grid": merged_grid,
+                    "scanned": merged_known > 0,
+                    "source": "+".join(face_sources[fkey]),
+                    "sources": list(face_sources[fkey]),
+                    "mode": "auto",
+                    "confidence": min(1.0, eff_conf),
+                    "updated_at": now,
+                }
+
+        total_known = sum(
+            1 for fkey in FACES for row in self._faces[fkey]["grid"] for cell in row if cell != UNKNOWN
+        )
+        self._correlation = {
+            "active_cameras": [src for src, _ in active],
+            "camera_mappings": camera_mappings,
+            "correlated_faces": correlated_faces,
+            "total_known_stickers": total_known,
+            "updated_at": now,
+        }
+        return self._correlation
 
     def capture_face(
         self,
@@ -135,6 +481,18 @@ class CubeStateManager:
                 if not self._live.get("detected"):
                     raise ValueError("No Rubik's cube face currently detected in live view")
                 used_source = source or str(self._live.get("source", "live"))
+                if is_auto and len(self._live_by_source) >= 2:
+                    corr = self._correlate_multicam_locked(auto_fill=True)
+                    captured = list(corr.get("correlated_faces") or [])
+                    if captured:
+                        for fkey in captured:
+                            if self._faces[fkey]["scanned"]:
+                                self._faces[fkey]["mode"] = "manual"
+                        return {
+                            "captured_face": captured[0],
+                            "captured_faces": captured,
+                            "state": self._snapshot_locked(),
+                        }
                 visible_faces = self._live.get("visible_faces") or []
                 if is_auto and len(visible_faces) >= 2:
                     captured_faces: list[str] = []
@@ -143,16 +501,18 @@ class CubeStateManager:
                         known = sum(1 for r in vf_grid for c in r if c != UNKNOWN)
                         if known < 4:
                             continue
-                        role = str(vf.get("face", "")).strip().upper()
+                        role = str(vf.get("canonical_face") or vf.get("face") or "").strip().upper()
                         target = self._pick_face_by_center_locked(vf_grid[1][1], preferred=role if role in FACES else None)
                         existing_known = sum(1 for r in self._faces[target]["grid"] for c in r if c != UNKNOWN)
-                        if self._faces[target]["scanned"] and existing_known > known:
+                        if self._faces[target]["scanned"] and self._faces[target].get("mode") == "manual" and existing_known > known:
                             continue
                         vf_conf = float(vf.get("confidence", self._live.get("confidence", 0.0))) if confidence is None else float(confidence)
                         self._faces[target] = {
                             "grid": vf_grid,
                             "scanned": True,
                             "source": used_source,
+                            "sources": [used_source],
+                            "mode": "manual",
                             "confidence": round(vf_conf, 3),
                             "updated_at": time.time(),
                         }
@@ -177,10 +537,13 @@ class CubeStateManager:
                 if target_face not in FACES:
                     raise ValueError(f"Face must be one of {FACES} or AUTO")
 
+            mode = "claude" if used_source == "claude" else "manual"
             self._faces[target_face] = {
                 "grid": norm_grid,
                 "scanned": True,
                 "source": used_source,
+                "sources": [used_source],
+                "mode": mode,
                 "confidence": round(used_conf, 3),
                 "updated_at": time.time(),
             }
@@ -209,6 +572,7 @@ class CubeStateManager:
             raise ValueError(f"Face must be one of {FACES}")
         with self._lock:
             self._faces[target]["grid"] = rotate_grid_cw(self._faces[target]["grid"], turns_cw)
+            self._faces[target]["mode"] = "manual"
             self._faces[target]["updated_at"] = time.time()
             return self._snapshot_locked()
 
@@ -226,6 +590,7 @@ class CubeStateManager:
             self._faces[target]["scanned"] = any(
                 cell != UNKNOWN for r in self._faces[target]["grid"] for cell in r
             )
+            self._faces[target]["mode"] = "manual" if self._faces[target]["scanned"] else ""
             self._faces[target]["updated_at"] = time.time()
             return self._snapshot_locked()
 
@@ -298,6 +663,7 @@ class CubeStateManager:
         return {
             "live": copy.deepcopy(self._live),
             "live_by_source": copy.deepcopy(self._live_by_source),
+            "correlation": copy.deepcopy(self._correlation),
             "faces": copy.deepcopy(self._faces),
             "validation": self._validation_locked(),
         }

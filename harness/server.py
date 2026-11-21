@@ -322,20 +322,25 @@ class DualArmPolicyEngine:
             source_now = str(snap.get("source") or "")
             if updated_at is not None and not source_now.startswith("inference:") and (time.time() - float(updated_at)) < 1.5:
                 return
-            best_det: dict[str, Any] | None = None
-            best_cam = ""
-            for cam_name in ("front", "left_wrist", "right_wrist"):
+            detections: list[tuple[str, dict[str, Any]]] = []
+            for cam_name in ("front", "right_wrist", "left_wrist"):
                 raw = images_b64.get(cam_name)
                 if not raw:
                     continue
                 det = detect_cube_cv(raw, source=f"inference:{cam_name}")
-                if det.get("detected") and (best_det is None or det.get("confidence", 0.0) > best_det.get("confidence", 0.0)):
-                    best_det = det
-                    best_cam = cam_name
-            if best_det is not None:
-                self.prompt_ctrl.cube_state.update_live(best_det, source=f"inference:{best_cam}")
+                detections.append((f"inference:{cam_name}", det))
+            if any(d.get("detected") for _, d in detections):
+                for src_name, det in detections:
+                    if det.get("detected"):
+                        self.prompt_ctrl.cube_state.update_live(det, source=src_name, auto_correlate=False)
+                # Keep front as primary live if detected, otherwise highest-confidence detected cam
+                best_src, best_det = max(
+                    ((s, d) for s, d in detections if d.get("detected")),
+                    key=lambda item: (1 if item[0] == "inference:front" else 0, float(item[1].get("confidence", 0.0))),
+                )
+                self.prompt_ctrl.cube_state.update_live(best_det, source=best_src, auto_correlate=True, auto_fill=True)
             elif updated_at is None or source_now.startswith("inference:"):
-                self.prompt_ctrl.cube_state.update_live({"detected": False}, source="inference:front")
+                self.prompt_ctrl.cube_state.update_live({"detected": False}, source="inference:front", auto_correlate=False)
         except Exception:
             pass
 
@@ -576,10 +581,14 @@ CONSOLE_HTML = r"""<!doctype html>
         <label style="display:flex;align-items:center;gap:4px">
           <input id="cube-live-cv" type="checkbox" checked> Live CV
         </label>
+        <label style="display:flex;align-items:center;gap:4px" title="Automatically correlate all 3 cameras into the 3D cube model">
+          <input id="cube-auto-fill" type="checkbox" checked> Auto-fill 3D
+        </label>
         <span class="hint" style="margin:0">Detected:</span>
         <div id="cube-live-mini" class="live-mini" aria-label="Live detected 3x3 grid"></div>
       </div>
       <div class="row" style="align-items:center">
+        <button id="cube-correlate-btn" type="button">Correlate 3 Cams</button>
         <select id="cube-target-face" aria-label="Target cube face">
           <option value="AUTO">Auto face (center)</option>
           <option value="F">F (Front)</option>
@@ -589,7 +598,7 @@ CONSOLE_HTML = r"""<!doctype html>
           <option value="B">B (Back)</option>
           <option value="D">D (Down)</option>
         </select>
-        <button id="cube-capture-btn" type="button">Capture Face</button>
+        <button id="cube-capture-btn" type="button" class="sec">Lock / Capture</button>
         <button id="cube-claude-btn" type="button" class="sec">Scan with Claude</button>
         <button id="cube-rotate-btn" type="button" class="sec">Rotate Selected 90°</button>
         <button id="cube-reset-btn" type="button" class="sec">Reset</button>
@@ -1244,8 +1253,11 @@ const cubeCountsEl = document.getElementById('cube-counts');
 const cubeIssuesEl = document.getElementById('cube-val-issues');
 const cubeCamSelect = document.getElementById('cube-camera');
 const cubeLiveCheck = document.getElementById('cube-live-cv');
+const cubeAutoFillCheck = document.getElementById('cube-auto-fill');
 const cubeTargetFace = document.getElementById('cube-target-face');
 const cubeClaudeBtn = document.getElementById('cube-claude-btn');
+const cubeCorrelateBtn = document.getElementById('cube-correlate-btn');
+let cubeInitialCorrelated = false;
 
 // Initialize 3x3 mini grid placeholders
 for (let i = 0; i < 9; i++) {
@@ -1260,7 +1272,9 @@ const FACE_OVERLAY_COLOR = {
   U: '#38bdf8',
   F: '#a855f7',
   R: '#34d399',
-  L: '#fbbf24'
+  L: '#fbbf24',
+  B: '#f472b6',
+  D: '#94a3b8'
 };
 
 function drawFeedOverlay(feed) {
@@ -1297,7 +1311,8 @@ function drawFeedOverlay(feed) {
   for (const vf of vfaces) {
     if (!vf.quad || vf.quad.length < 4) continue;
     const pts = vf.quad.map(toPx);
-    const strokeCol = FACE_OVERLAY_COLOR[vf.face] || '#38bdf8';
+    const faceTag = vf.canonical_face || vf.face || '';
+    const strokeCol = FACE_OVERLAY_COLOR[faceTag] || '#38bdf8';
     ctx.strokeStyle = strokeCol;
     ctx.lineWidth = 2.2;
     ctx.beginPath();
@@ -1306,12 +1321,12 @@ function drawFeedOverlay(feed) {
     ctx.closePath();
     ctx.stroke();
 
-    if (vf.face) {
+    if (faceTag) {
       const lx = pts[0][0];
       const ly = Math.max(12, pts[0][1] - 4);
       ctx.fillStyle = strokeCol;
       ctx.font = '700 10px system-ui, sans-serif';
-      ctx.fillText(vf.face, lx, ly);
+      ctx.fillText(faceTag, lx, ly);
     }
 
     if (vf.cell_centers && vf.grid) {
@@ -1385,7 +1400,8 @@ function render3DCube() {
       liveFaceMap[targetPreviewFace] = live.grid;
     }
   }
-  const polys = [];
+  const corrFaces = cubeState?.correlation?.correlated_faces || [];
+  const faceDraws = [];
 
   for (const [faceKey, basis] of Object.entries(FACE_BASIS)) {
     const nt = xform3D(basis.n);
@@ -1393,11 +1409,12 @@ function render3DCube() {
     const faceData = faces?.[faceKey];
     const liveGrid = liveFaceMap[faceKey];
     const useLivePreview = Boolean(liveGrid && !faceData?.scanned);
-    const grid = useLivePreview
-      ? liveGrid
-      : (faceData?.grid || [['?','?','?'],['?','?','?'],['?','?','?']]);
+    const isLiveLinked = corrFaces.includes(faceKey) || useLivePreview;
+    const grid = faceData?.scanned
+      ? faceData.grid
+      : (liveGrid || [['?','?','?'],['?','?','?'],['?','?','?']]);
 
-    // Dark cube body quad
+    // Dark cube body quad (always drawn before its 9 stickers so tilted stickers are never occluded)
     const bodyPts = [[-1,-1],[1,-1],[1,1],[-1,1]].map(([su, sv]) => {
       const p3 = [
         basis.o[0] + basis.u[0]*su + basis.v[0]*sv,
@@ -1407,9 +1424,8 @@ function render3DCube() {
       return xform3D(p3);
     });
     const bodyDepth = bodyPts.reduce((acc, p) => acc + p[2], 0) / 4;
-    polys.push({ depth: bodyDepth - 0.01, pts: bodyPts, fill: '#141821', stroke: useLivePreview ? (FACE_OVERLAY_COLOR[faceKey] || '#38bdf8') : '#2a3242', lineWidth: useLivePreview ? 2 : 1 });
+    const stickers = [];
 
-    // 3x3 stickers slightly raised along normal
     for (let r = 0; r < 3; r++) {
       for (let c = 0; c < 3; c++) {
         const u0 = -1 + (c * 2) / 3 + 0.06;
@@ -1425,54 +1441,66 @@ function render3DCube() {
           return xform3D(p3);
         });
         const code = grid[r]?.[c] || '?';
-        const depth = sPts.reduce((acc, p) => acc + p[2], 0) / 4;
-        const shade = Math.max(0.75, Math.min(1.0, 0.72 + nt[2] * 0.32));
-        polys.push({
-          depth,
+        const shade = Math.max(0.82, Math.min(1.0, 0.78 + nt[2] * 0.24));
+        stickers.push({
           pts: sPts,
           fill: CUBE_PALETTE[code] || CUBE_PALETTE['?'],
           stroke: '#0b0e14',
-          lineWidth: 1,
+          lineWidth: 1.1,
           label: (r === 1 && c === 1) ? faceKey : '',
           textColor: CUBE_TEXT[code] || '#fff',
-          alpha: (code === '?' ? 0.65 : shade)
+          alpha: (code === '?' ? 0.55 : shade)
         });
       }
     }
+    faceDraws.push({
+      depth: bodyDepth,
+      bodyPts,
+      bodyStroke: isLiveLinked ? (FACE_OVERLAY_COLOR[faceKey] || '#38bdf8') : '#2a3242',
+      bodyLineWidth: isLiveLinked ? 2 : 1,
+      stickers
+    });
   }
 
-  polys.sort((a, b) => a.depth - b.depth);
+  faceDraws.sort((a, b) => a.depth - b.depth);
   const scale = Math.min(w, h) * 0.33;
   const cx = w * 0.5;
   const cy = h * 0.5;
   const camDist = 4.6;
 
-  for (const poly of polys) {
-    const proj = poly.pts.map(([x, y, z]) => {
+  function drawPoly3D(pts, fill, stroke, lineWidth, alpha, label, textColor) {
+    const proj = pts.map(([x, y, z]) => {
       const f = camDist / (camDist - z);
       return [cx + x * scale * f, cy - y * scale * f];
     });
     cubeCtx.save();
-    if (poly.alpha !== undefined) cubeCtx.globalAlpha = poly.alpha;
+    if (alpha !== undefined) cubeCtx.globalAlpha = alpha;
     cubeCtx.beginPath();
     cubeCtx.moveTo(proj[0][0], proj[0][1]);
     for (let i = 1; i < proj.length; i++) cubeCtx.lineTo(proj[i][0], proj[i][1]);
     cubeCtx.closePath();
-    cubeCtx.fillStyle = poly.fill;
+    cubeCtx.fillStyle = fill;
     cubeCtx.fill();
-    cubeCtx.lineWidth = poly.lineWidth;
-    cubeCtx.strokeStyle = poly.stroke;
+    cubeCtx.lineWidth = lineWidth;
+    cubeCtx.strokeStyle = stroke;
     cubeCtx.stroke();
-    if (poly.label) {
+    if (label) {
       const mx = proj.reduce((a, p) => a + p[0], 0) / 4;
       const my = proj.reduce((a, p) => a + p[1], 0) / 4;
-      cubeCtx.fillStyle = poly.textColor;
+      cubeCtx.fillStyle = textColor;
       cubeCtx.font = '700 11px system-ui, sans-serif';
       cubeCtx.textAlign = 'center';
       cubeCtx.textBaseline = 'middle';
-      cubeCtx.fillText(poly.label, mx, my);
+      cubeCtx.fillText(label, mx, my);
     }
     cubeCtx.restore();
+  }
+
+  for (const fd of faceDraws) {
+    drawPoly3D(fd.bodyPts, '#141821', fd.bodyStroke, fd.bodyLineWidth, 1.0, '', '');
+    for (const st of fd.stickers) {
+      drawPoly3D(st.pts, st.fill, st.stroke, st.lineWidth, st.alpha, st.label, st.textColor);
+    }
   }
 }
 
@@ -1547,7 +1575,11 @@ function renderCubeUI(state) {
     });
     const lbl = document.createElement('div');
     lbl.className = 'net-face-label';
-    lbl.textContent = faceKey + (faceEntry?.scanned ? ' ✓' : '');
+    const nCams = faceEntry?.sources?.length || 0;
+    lbl.textContent = faceKey + (faceEntry?.scanned ? (nCams > 1 ? ` ✓ (${nCams})` : ' ✓') : '');
+    if (nCams) {
+      box.title = 'Sources: ' + faceEntry.sources.map(s => feeds.get(s)?.label || s).join(', ');
+    }
     const gEl = document.createElement('div');
     gEl.className = 'net-grid';
     for (let r = 0; r < 3; r++) {
@@ -1582,6 +1614,12 @@ function renderCubeUI(state) {
   }
   cubeIssuesEl.textContent = (val.issues && val.issues.length) ? val.issues.join(' · ') : '';
 
+  const corr = state?.correlation;
+  if (corr?.active_cameras?.length) {
+    const camNames = corr.active_cameras.map(s => feeds.get(s)?.label || s).join(' + ');
+    const fList = (corr.correlated_faces || []).join(', ') || 'none';
+    cubeStatusEl.textContent = `Correlated ${corr.active_cameras.length} camera(s) (${camNames}) -> faces [${fList}] (${ks}/54 stickers).`;
+  }
   cubeClaudeBtn.disabled = !state?.claude_scan_ready;
   cubeClaudeBtn.title = state?.claude_scan_ready
     ? 'Send current camera frames to Claude Vision'
@@ -1616,14 +1654,45 @@ async function refreshCubeState() {
   } catch (_) {}
 }
 
+async function runCorrelateAllCameras(autoFill = true) {
+  const images = {};
+  for (const feed of feeds.values()) {
+    if (feed.latestB64) images[feed.topic] = feed.latestB64;
+  }
+  if (!Object.keys(images).length) return null;
+  const r = await fetch('/api/cube/correlate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ images_b64: images, auto_fill: autoFill })
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || 'Multi-camera correlation failed.');
+  if (d.state) renderCubeUI(d.state);
+  return d;
+}
+
 async function stepLiveCubeDetection() {
   if (!cubeLiveCheck.checked || cubeDetectInFlight || !cameraSocket) return;
   const mode = cubeCamSelect.value;
+  const autoFill = Boolean(cubeAutoFillCheck?.checked);
+  if (mode === 'auto' && !cubeInitialCorrelated) {
+    const readyFeeds = [...feeds.values()].filter(f => Boolean(f.latestB64));
+    if (readyFeeds.length >= 2) {
+      cubeDetectInFlight = true;
+      try {
+        await runCorrelateAllCameras(autoFill);
+        cubeInitialCorrelated = true;
+      } catch (_) {
+      } finally {
+        cubeDetectInFlight = false;
+      }
+      return;
+    }
+  }
   let chosen = null;
   if (mode === 'auto') {
     const available = [...feeds.values()].filter(f => Boolean(f.latestB64));
     if (!available.length) return;
-    // Cycle across all active feeds so every camera view keeps an up-to-date overlay
     chosen = available[cubeAutoIndex % available.length];
     cubeAutoIndex++;
   } else {
@@ -1636,7 +1705,12 @@ async function stepLiveCubeDetection() {
     const r = await fetch('/api/cube/detect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_b64: chosen.latestB64, source: chosen.topic })
+      body: JSON.stringify({
+        image_b64: chosen.latestB64,
+        source: chosen.topic,
+        auto_correlate: true,
+        auto_fill: autoFill
+      })
     });
     if (r.ok) renderCubeUI(await r.json());
   } catch (_) {
@@ -1644,6 +1718,19 @@ async function stepLiveCubeDetection() {
     cubeDetectInFlight = false;
   }
 }
+
+cubeCorrelateBtn.addEventListener('click', async () => {
+  cubeCorrelateBtn.disabled = true;
+  cubeStatusEl.textContent = 'Correlating all active cameras into 3D model…';
+  try {
+    const res = await runCorrelateAllCameras(true);
+    if (!res) cubeStatusEl.textContent = 'Connect to rosbridge first so camera frames are available.';
+  } catch (err) {
+    cubeStatusEl.textContent = err.message;
+  } finally {
+    cubeCorrelateBtn.disabled = false;
+  }
+});
 
 document.getElementById('cube-capture-btn').addEventListener('click', async () => {
   const face = cubeTargetFace.value;
@@ -1662,6 +1749,7 @@ document.getElementById('cube-rotate-btn').addEventListener('click', async () =>
 });
 
 document.getElementById('cube-reset-btn').addEventListener('click', async () => {
+  cubeInitialCorrelated = false;
   const res = await postCubeAction('/api/cube/reset', {});
   if (res) cubeStatusEl.textContent = 'Reset all 6 faces of the 3D cube model.';
 });
@@ -1869,9 +1957,29 @@ def start_console_http_server(
                     if self.path == "/api/cube/detect":
                         img_b64 = req_obj.get("image_b64", "")
                         source_name = str(req_obj.get("source", ""))
+                        auto_corr = bool(req_obj.get("auto_correlate", True))
+                        auto_fill = bool(req_obj.get("auto_fill", True))
                         det = detect_cube_cv(img_b64, source=source_name)
-                        prompt_ctrl.cube_state.update_live(det, source=source_name)
+                        prompt_ctrl.cube_state.update_live(
+                            det,
+                            source=source_name,
+                            auto_correlate=auto_corr,
+                            auto_fill=auto_fill,
+                        )
                         self.reply_json(200, self._cube_snapshot())
+                    elif self.path == "/api/cube/correlate":
+                        images = req_obj.get("images_b64")
+                        auto_fill = bool(req_obj.get("auto_fill", True))
+                        if isinstance(images, dict) and any(images.values()):
+                            for src_key, raw_b64 in images.items():
+                                if not raw_b64:
+                                    continue
+                                src_name = str(src_key)
+                                det = detect_cube_cv(raw_b64, source=src_name)
+                                prompt_ctrl.cube_state.update_live(det, source=src_name, auto_correlate=False)
+                        corr_res = prompt_ctrl.cube_state.correlate_multicam(auto_fill=auto_fill)
+                        corr_res["state"]["claude_scan_ready"] = self._cube_snapshot()["claude_scan_ready"]
+                        self.reply_json(200, corr_res)
                     elif self.path == "/api/cube/capture":
                         cap = prompt_ctrl.cube_state.capture_face(
                             face=req_obj.get("face"),

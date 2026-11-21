@@ -451,7 +451,7 @@ def _gripper_occlusion_mask(patch: np.ndarray, use_cv2: bool = True) -> np.ndarr
         for b in _connected_blobs(comp_mask, use_cv2=use_cv2, connectivity=4, min_area=min_arm_area):
             x0, y0, x1, y1 = b["bbox"]
             touches_border = (x0 <= 2) or (y0 <= 2) or (x1 >= pw - 2) or (y1 >= ph - 2)
-            if touches_border or b["area"] >= max(600, int(0.025 * ph * pw)):
+            if touches_border:
                 occ[y0:y1, x0:x1] |= (b["labels_ref"][y0:y1, x0:x1] == b["label"])
     return _box_any(occ, 5, use_cv2=use_cv2)
 
@@ -878,7 +878,7 @@ def _detect_cube_lattice_multiface(
     for sx, sy, sbw, sbh in cands:
         cx = int(round((sx + sbw * 0.5) / rel_scale))
         cy = int(round((sy + sbh * 0.5) / rel_scale))
-        half = int(round(max(70.0, max(sbw, sbh) * 2.25) / rel_scale))
+        half = int(round(max(98.0, max(sbw, sbh) * 2.5) / rel_scale))
         x0, y0 = max(0, cx - half), max(0, cy - half)
         x1, y1 = min(work_w, cx + half), min(work_h, cy + half)
         if x1 - x0 < 24 or y1 - y0 < 24:
