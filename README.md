@@ -62,6 +62,15 @@ For physical jogging on an assigned, idle Desktop station, install the [X Square
 
 In the live manual console, use the left or right arm panel to home that arm or open and close its gripper. Homing uses the SDK reset. The gripper buttons use that gripper's limits from the station URDF. The joint table shows both measured gripper angles.
 
+## Rubik's Cube Live Detection and 3D Model
+
+Once connected to rosbridge (or while port `8001` inference frames are streaming), the console runs a local NumPy and Pillow detector (`harness/cube_vision.py`) on the selected camera stream and overlays the bounding quad, 3x3 sticker classifications, and an uncalibrated optical-frame distance estimate directly on the live camera tile.
+
+- **Interactive 3D Cube Viewer**: Drag the 3D cube in the console to orbit (`Iso`, `Front`, `Back`, `Top`, `Bottom`), rendered offline with HTML5 Canvas and zero external CDN scripts.
+- **Multi-Face Accumulation (`U R F D L B`)**: Click **Capture Face** to store the live detected 3x3 grid into `Auto face (center)` or an explicit face (`F`, `R`, `U`, `L`, `B`, `D`), click **Rotate Selected 90°** to align tilted scans, or click any sticker in the unfolded net to cycle its color (`W`, `Y`, `R`, `O`, `B`, `G`, `?`).
+- **Claude Multi-Face Scan**: When an Anthropic key is configured, click **Scan with Claude** to inspect all visible live camera views at once and populate oblique faces.
+- **Invariant Validation**: The console tracks scanned faces, per-color counts (expecting 9 per color and 6 unique centers), and outputs a canonical 54-character `U R F D L B` facelet string once all 6 faces are complete.
+
 ## Safety
 
 - Never start another ROS2 control node (`start_desktop.sh` or `infer_with_dispatcher`) while the robot stack is already running.

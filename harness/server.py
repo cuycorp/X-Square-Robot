@@ -28,7 +28,10 @@ from claude_policy import (
     HeuristicOfflinePlanner,
     PlannerDecision,
     hold_pose_decision,
+    load_anthropic_api_key,
 )
+from cube_state import CubeStateManager
+from cube_vision import detect_cube_cv, scan_cube_with_claude
 from kinematics import arm_chain, jog_target, preview as preview_kinematics
 from protocol import (
     ProtocolError,
@@ -77,6 +80,7 @@ class PromptController:
         }
         self._history: deque[dict[str, Any]] = deque(maxlen=40)
         self._images_b64: dict[str, str] = {}
+        self.cube_state = CubeStateManager()
 
     def set_prompt(self, prompt: str | None) -> int:
         with self._lock:
@@ -277,6 +281,7 @@ class DualArmPolicyEngine:
                     flush=True,
                 )
 
+            self._update_passive_cube_detection(req.images_b64)
             self.prompt_ctrl.record_step(
                 chunk_index=self.chunk_index,
                 instruction=req.instruction,
@@ -309,6 +314,30 @@ class DualArmPolicyEngine:
         except ProtocolError as err:
             self._write_log({"event": "protocol_error", "code": err.code, "message": err.message})
             return err.to_dict()
+
+    def _update_passive_cube_detection(self, images_b64: dict[str, str]) -> None:
+        try:
+            snap = self.prompt_ctrl.cube_state.snapshot()["live"]
+            updated_at = snap.get("updated_at")
+            source_now = str(snap.get("source") or "")
+            if updated_at is not None and not source_now.startswith("inference:") and (time.time() - float(updated_at)) < 1.5:
+                return
+            best_det: dict[str, Any] | None = None
+            best_cam = ""
+            for cam_name in ("front", "left_wrist", "right_wrist"):
+                raw = images_b64.get(cam_name)
+                if not raw:
+                    continue
+                det = detect_cube_cv(raw, source=f"inference:{cam_name}")
+                if det.get("detected") and (best_det is None or det.get("confidence", 0.0) > best_det.get("confidence", 0.0)):
+                    best_det = det
+                    best_cam = cam_name
+            if best_det is not None:
+                self.prompt_ctrl.cube_state.update_live(best_det, source=f"inference:{best_cam}")
+            elif updated_at is None or source_now.startswith("inference:"):
+                self.prompt_ctrl.cube_state.update_live({"detected": False}, source="inference:front")
+        except Exception:
+            pass
 
     def _write_log(self, entry: dict[str, Any]) -> None:
         line = json.dumps(entry)
@@ -417,6 +446,27 @@ CONSOLE_HTML = r"""<!doctype html>
   .warn { background: #fff4e5; border: 1px solid #f5c26b; padding: 7px 10px; border-radius: 8px; font-size: 13px; margin: 6px 0 10px; }
   .jog-output { display: flex; flex-wrap: wrap; gap: 4px 12px; }
   .jog-output span { white-space: nowrap; }
+  .camera-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .cube-toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .cube-toolbar select { padding: 3px 6px; font: inherit; border: 1px solid #cfd6e4; border-radius: 5px; background: #fff; }
+  .cube-layout { display: grid; grid-template-columns: minmax(230px, 280px) minmax(0, 1fr); gap: 10px; align-items: start; }
+  .cube-stage { display: flex; flex-direction: column; align-items: center; gap: 6px; background: #f8fafd; border: 1px solid #e2e6ee; border-radius: 6px; padding: 8px; }
+  #cube-3d { width: 100%; max-width: 260px; height: 220px; display: block; cursor: grab; touch-action: none; border-radius: 6px; background: radial-gradient(circle at 50% 40%, #232a38, #121722); }
+  #cube-3d:active { cursor: grabbing; }
+  .cube-view-btns { display: flex; flex-wrap: wrap; gap: 4px; justify-content: center; }
+  .cube-view-btns button { min-height: 22px; padding: 2px 7px; font-size: 11px; }
+  .cube-net-wrap { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .cube-net { display: grid; grid-template-columns: repeat(4, minmax(56px, 74px)); grid-template-rows: repeat(3, auto); gap: 6px; align-items: center; }
+  .net-face { border: 2px solid #d5dde9; border-radius: 6px; padding: 4px; background: #181d27; cursor: pointer; }
+  .net-face.active { border-color: #4f44e1; box-shadow: 0 0 0 2px #4f44e133; }
+  .net-face-label { font-size: 10px; font-weight: 700; color: #dbe2ef; text-align: center; margin-bottom: 3px; letter-spacing: .04em; }
+  .net-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; }
+  .net-cell { aspect-ratio: 1; border-radius: 2px; border: 0; padding: 0; min-height: 0; font-size: 9px; font-weight: 700; cursor: pointer; display: grid; place-items: center; }
+  .live-mini { display: inline-grid; grid-template-columns: repeat(3, 16px); gap: 2px; padding: 3px; background: #181d27; border-radius: 4px; vertical-align: middle; }
+  .live-mini span { width: 16px; height: 16px; border-radius: 2px; display: grid; place-items: center; font-size: 9px; font-weight: 700; }
+  .cube-badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; background: #eef1f7; color: #364154; }
+  .cube-badge.ok { background: #e6f6ec; color: #166534; }
+  .cube-badge.warn { background: #fff4e5; color: #9a5b13; }
   @media (max-width: 820px) {
     .dashboard { display: block; }
     .sidebar { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
@@ -508,7 +558,68 @@ CONSOLE_HTML = r"""<!doctype html>
     <output id="ik-result" for="ik-arm ik-solve"></output>
     </dialog>
   </section>
-  <aside class="sidebar">
+  <section class="card" id="cube-card" aria-labelledby="cube-title" style="grid-column: 1;">
+    <div class="jog-header">
+      <h2 id="cube-title">Rubik's Cube 3D Scanner</h2>
+      <span id="cube-detect-badge" class="cube-badge">No cube detected</span>
+    </div>
+    <div class="cube-toolbar">
+      <div class="row" style="align-items:center">
+        <label>Camera
+          <select id="cube-camera">
+            <option value="auto">Auto (all feeds)</option>
+            <option value="/camera_head_front/color/image_raw/compressed">Front camera</option>
+            <option value="/camera1/usb_cam1/image_raw/image_compressed">Camera 1</option>
+            <option value="/camera3/usb_cam3/image_raw/image_compressed">Camera 3</option>
+          </select>
+        </label>
+        <label style="display:flex;align-items:center;gap:4px">
+          <input id="cube-live-cv" type="checkbox" checked> Live CV
+        </label>
+        <span class="hint" style="margin:0">Detected:</span>
+        <div id="cube-live-mini" class="live-mini" aria-label="Live detected 3x3 grid"></div>
+      </div>
+      <div class="row" style="align-items:center">
+        <select id="cube-target-face" aria-label="Target cube face">
+          <option value="AUTO">Auto face (center)</option>
+          <option value="F">F (Front)</option>
+          <option value="R">R (Right)</option>
+          <option value="U">U (Up)</option>
+          <option value="L">L (Left)</option>
+          <option value="B">B (Back)</option>
+          <option value="D">D (Down)</option>
+        </select>
+        <button id="cube-capture-btn" type="button">Capture Face</button>
+        <button id="cube-claude-btn" type="button" class="sec">Scan with Claude</button>
+        <button id="cube-rotate-btn" type="button" class="sec">Rotate Selected 90°</button>
+        <button id="cube-reset-btn" type="button" class="sec">Reset</button>
+      </div>
+    </div>
+    <p id="cube-status" class="hint" role="status">Point any camera at the Rubik's cube or connect rosbridge to scan faces into the 3D model.</p>
+    <div class="cube-layout">
+      <div class="cube-stage">
+        <canvas id="cube-3d" width="260" height="220" aria-label="Interactive 3D Rubik's cube"></canvas>
+        <div class="cube-view-btns">
+          <button type="button" class="sec" data-cube-view="iso">Iso</button>
+          <button type="button" class="sec" data-cube-view="front">Front</button>
+          <button type="button" class="sec" data-cube-view="back">Back</button>
+          <button type="button" class="sec" data-cube-view="top">Top</button>
+          <button type="button" class="sec" data-cube-view="bottom">Bottom</button>
+        </div>
+        <span class="hint" style="margin:0;text-align:center">Drag 3D cube to orbit. Dashed border shows live preview before capture.</span>
+      </div>
+      <div class="cube-net-wrap">
+        <div id="cube-net" class="cube-net" aria-label="Unfolded 6-face Rubik's cube net"></div>
+        <div class="row" style="align-items:center;gap:8px">
+          <span id="cube-val-badge" class="cube-badge">0/6 faces · 0/54 stickers</span>
+          <span id="cube-counts" class="hint" style="margin:0"></span>
+        </div>
+        <p id="cube-val-issues" class="hint" style="margin:0;color:#9a5b13"></p>
+        <p class="hint" style="margin:0">Click any face in the net to select it for rotation, or click any sticker to cycle its color (W, Y, R, O, B, G, ?).</p>
+      </div>
+    </div>
+  </section>
+  <aside class="sidebar" style="grid-row: 1 / span 2; grid-column: 2;">
     <section class="card" aria-labelledby="joints-title">
       <h2 id="joints-title">Measured Joint Angles</h2>
       <p id="joints-status" class="hint" role="status">Connect to rosbridge above to read joint states.</p>
@@ -622,19 +733,22 @@ const feeds = new Map([
   const image = document.createElement('img');
   image.alt = label;
   image.hidden = true;
+  const overlay = document.createElement('canvas');
+  overlay.className = 'camera-overlay';
   const message = document.createElement('p');
   message.textContent = 'Connect to view';
   const caption = document.createElement('figcaption');
   caption.textContent = label;
-  view.append(image, message);
+  view.append(image, overlay, message);
   tile.append(view, caption);
   document.getElementById('live-cameras').append(tile);
-  const feed = { image, message, timer: undefined };
+  const feed = { topic, label, image, overlay, message, timer: undefined, latestB64: '' };
   image.addEventListener('load', () => {
     if (!cameraSocket || !image.naturalWidth) return;
     image.hidden = false;
     message.hidden = true;
     watchForCameraFrames(feed);
+    drawFeedOverlay(feed);
   });
   return [topic, feed];
 }));
@@ -887,10 +1001,13 @@ if (sessionStorage.getItem('robot-rosbridge')) {
 
 function clearCameraFrame(feed, detail) {
   clearTimeout(feed.timer);
+  feed.latestB64 = '';
   feed.image.hidden = true;
   feed.image.removeAttribute('src');
   feed.message.textContent = detail;
   feed.message.hidden = false;
+  const ctx = feed.overlay.getContext('2d');
+  if (ctx) ctx.clearRect(0, 0, feed.overlay.width, feed.overlay.height);
 }
 
 function disconnectCamera(status, message) {
@@ -970,6 +1087,7 @@ cameraForm.addEventListener('submit', event => {
     if (!feed) return;
     const { format, data } = update.msg || {};
     if (typeof format !== 'string' || !/jpeg|jpg/i.test(format) || typeof data !== 'string' || !data) return;
+    feed.latestB64 = data;
     feed.image.src = 'data:image/jpeg;base64,' + data;
   });
   socket.addEventListener('error', () => {
@@ -1081,6 +1199,443 @@ async function poll() {
     }
   } catch (_) {}
 }
+
+const CUBE_PALETTE = {
+  W: '#f8fafc',
+  Y: '#facc15',
+  R: '#dc2626',
+  O: '#f97316',
+  B: '#2563eb',
+  G: '#16a34a',
+  '?': '#64748b'
+};
+const CUBE_TEXT = {
+  W: '#0f172a', Y: '#0f172a', R: '#ffffff', O: '#0f172a', B: '#ffffff', G: '#ffffff', '?': '#e2e8f0'
+};
+const CUBE_CYCLE = ['W', 'Y', 'R', 'O', 'B', 'G', '?'];
+const NET_LAYOUT = [
+  ['U', 2, 1],
+  ['L', 1, 2], ['F', 2, 2], ['R', 3, 2], ['B', 4, 2],
+  ['D', 2, 3]
+];
+
+let cubeState = null;
+let selectedCubeFace = 'F';
+let cubeYaw = -0.58;
+let cubePitch = 0.44;
+let cubeDetectInFlight = false;
+let cubeAutoIndex = 0;
+
+const cubeCanvas = document.getElementById('cube-3d');
+const cubeCtx = cubeCanvas.getContext('2d');
+const cubeStatusEl = document.getElementById('cube-status');
+const cubeDetectBadge = document.getElementById('cube-detect-badge');
+const cubeLiveMini = document.getElementById('cube-live-mini');
+const cubeNetEl = document.getElementById('cube-net');
+const cubeValBadge = document.getElementById('cube-val-badge');
+const cubeCountsEl = document.getElementById('cube-counts');
+const cubeIssuesEl = document.getElementById('cube-val-issues');
+const cubeCamSelect = document.getElementById('cube-camera');
+const cubeLiveCheck = document.getElementById('cube-live-cv');
+const cubeTargetFace = document.getElementById('cube-target-face');
+const cubeClaudeBtn = document.getElementById('cube-claude-btn');
+
+// Initialize 3x3 mini grid placeholders
+for (let i = 0; i < 9; i++) {
+  const cell = document.createElement('span');
+  cell.textContent = '?';
+  cell.style.background = CUBE_PALETTE['?'];
+  cell.style.color = CUBE_TEXT['?'];
+  cubeLiveMini.append(cell);
+}
+
+function drawFeedOverlay(feed) {
+  const canvas = feed.overlay;
+  const rect = feed.image.getBoundingClientRect();
+  const cw = Math.max(1, Math.round(rect.width));
+  const ch = Math.max(1, Math.round(rect.height));
+  if (canvas.width !== cw || canvas.height !== ch) {
+    canvas.width = cw;
+    canvas.height = ch;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, cw, ch);
+  const live = cubeState && cubeState.live;
+  if (!live || !live.detected || !live.quad || live.source !== feed.topic || feed.image.hidden || !feed.image.naturalWidth) {
+    return;
+  }
+  const natW = feed.image.naturalWidth;
+  const natH = feed.image.naturalHeight;
+  const scale = Math.min(cw / natW, ch / natH);
+  const drawW = natW * scale;
+  const drawH = natH * scale;
+  const offX = (cw - drawW) * 0.5;
+  const offY = (ch - drawH) * 0.5;
+  const toPx = ([nx, ny]) => [offX + nx * drawW, offY + ny * drawH];
+
+  const pts = live.quad.map(toPx);
+  ctx.save();
+  ctx.strokeStyle = '#38bdf8';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+  ctx.stroke();
+
+  if (live.cell_centers && live.grid) {
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        const [px, py] = toPx(live.cell_centers[r][c]);
+        const code = live.grid[r][c] || '?';
+        ctx.beginPath();
+        ctx.arc(px, py, 7, 0, Math.PI * 2);
+        ctx.fillStyle = CUBE_PALETTE[code] || CUBE_PALETTE['?'];
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = '#0f172a';
+        ctx.stroke();
+      }
+    }
+  }
+  ctx.restore();
+}
+
+function redrawAllFeedOverlays() {
+  for (const feed of feeds.values()) drawFeedOverlay(feed);
+}
+
+function rotY(p, a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return [p[0] * c + p[2] * s, p[1], -p[0] * s + p[2] * c];
+}
+function rotX(p, a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return [p[0], p[1] * c - p[2] * s, p[1] * s + p[2] * c];
+}
+function xform3D(p) {
+  return rotX(rotY(p, cubeYaw), cubePitch);
+}
+
+const FACE_BASIS = {
+  F: { o: [0, 0, 1], u: [1, 0, 0], v: [0, -1, 0], n: [0, 0, 1] },
+  R: { o: [1, 0, 0], u: [0, 0, -1], v: [0, -1, 0], n: [1, 0, 0] },
+  L: { o: [-1, 0, 0], u: [0, 0, 1], v: [0, -1, 0], n: [-1, 0, 0] },
+  B: { o: [0, 0, -1], u: [-1, 0, 0], v: [0, -1, 0], n: [0, 0, -1] },
+  U: { o: [0, 1, 0], u: [1, 0, 0], v: [0, 0, 1], n: [0, 1, 0] },
+  D: { o: [0, -1, 0], u: [1, 0, 0], v: [0, 0, -1], n: [0, -1, 0] }
+};
+
+function render3DCube() {
+  const w = cubeCanvas.width;
+  const h = cubeCanvas.height;
+  cubeCtx.clearRect(0, 0, w, h);
+
+  const live = cubeState?.live;
+  const faces = cubeState?.faces;
+  const targetPreviewFace = cubeTargetFace.value === 'AUTO' ? 'F' : cubeTargetFace.value;
+  const polys = [];
+
+  for (const [faceKey, basis] of Object.entries(FACE_BASIS)) {
+    const nt = xform3D(basis.n);
+    if (nt[2] <= 0.02) continue;
+    const faceData = faces?.[faceKey];
+    const useLivePreview = Boolean(live?.detected && (!faceData?.scanned || (cubeState?.validation?.scanned_faces === 0 && faceKey === targetPreviewFace)));
+    const grid = (useLivePreview && faceKey === targetPreviewFace)
+      ? live.grid
+      : (faceData?.grid || [['?','?','?'],['?','?','?'],['?','?','?']]);
+
+    // Dark cube body quad
+    const bodyPts = [[-1,-1],[1,-1],[1,1],[-1,1]].map(([su, sv]) => {
+      const p3 = [
+        basis.o[0] + basis.u[0]*su + basis.v[0]*sv,
+        basis.o[1] + basis.u[1]*su + basis.v[1]*sv,
+        basis.o[2] + basis.u[2]*su + basis.v[2]*sv
+      ];
+      return xform3D(p3);
+    });
+    const bodyDepth = bodyPts.reduce((acc, p) => acc + p[2], 0) / 4;
+    polys.push({ depth: bodyDepth - 0.01, pts: bodyPts, fill: '#141821', stroke: (useLivePreview && faceKey === targetPreviewFace) ? '#38bdf8' : '#2a3242', lineWidth: (useLivePreview && faceKey === targetPreviewFace) ? 2 : 1 });
+
+    // 3x3 stickers slightly raised along normal
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        const u0 = -1 + (c * 2) / 3 + 0.06;
+        const u1 = -1 + ((c + 1) * 2) / 3 - 0.06;
+        const v0 = -1 + (r * 2) / 3 + 0.06;
+        const v1 = -1 + ((r + 1) * 2) / 3 - 0.06;
+        const sPts = [[u0,v0],[u1,v0],[u1,v1],[u0,v1]].map(([su, sv]) => {
+          const p3 = [
+            basis.o[0] * 1.006 + basis.u[0]*su + basis.v[0]*sv,
+            basis.o[1] * 1.006 + basis.u[1]*su + basis.v[1]*sv,
+            basis.o[2] * 1.006 + basis.u[2]*su + basis.v[2]*sv
+          ];
+          return xform3D(p3);
+        });
+        const code = grid[r]?.[c] || '?';
+        const depth = sPts.reduce((acc, p) => acc + p[2], 0) / 4;
+        const shade = Math.max(0.75, Math.min(1.0, 0.72 + nt[2] * 0.32));
+        polys.push({
+          depth,
+          pts: sPts,
+          fill: CUBE_PALETTE[code] || CUBE_PALETTE['?'],
+          stroke: '#0b0e14',
+          lineWidth: 1,
+          label: (r === 1 && c === 1) ? faceKey : '',
+          textColor: CUBE_TEXT[code] || '#fff',
+          alpha: (code === '?' ? 0.65 : shade)
+        });
+      }
+    }
+  }
+
+  polys.sort((a, b) => a.depth - b.depth);
+  const scale = Math.min(w, h) * 0.33;
+  const cx = w * 0.5;
+  const cy = h * 0.5;
+  const camDist = 4.6;
+
+  for (const poly of polys) {
+    const proj = poly.pts.map(([x, y, z]) => {
+      const f = camDist / (camDist - z);
+      return [cx + x * scale * f, cy - y * scale * f];
+    });
+    cubeCtx.save();
+    if (poly.alpha !== undefined) cubeCtx.globalAlpha = poly.alpha;
+    cubeCtx.beginPath();
+    cubeCtx.moveTo(proj[0][0], proj[0][1]);
+    for (let i = 1; i < proj.length; i++) cubeCtx.lineTo(proj[i][0], proj[i][1]);
+    cubeCtx.closePath();
+    cubeCtx.fillStyle = poly.fill;
+    cubeCtx.fill();
+    cubeCtx.lineWidth = poly.lineWidth;
+    cubeCtx.strokeStyle = poly.stroke;
+    cubeCtx.stroke();
+    if (poly.label) {
+      const mx = proj.reduce((a, p) => a + p[0], 0) / 4;
+      const my = proj.reduce((a, p) => a + p[1], 0) / 4;
+      cubeCtx.fillStyle = poly.textColor;
+      cubeCtx.font = '700 11px system-ui, sans-serif';
+      cubeCtx.textAlign = 'center';
+      cubeCtx.textBaseline = 'middle';
+      cubeCtx.fillText(poly.label, mx, my);
+    }
+    cubeCtx.restore();
+  }
+}
+
+let dragPtr = null;
+cubeCanvas.addEventListener('pointerdown', e => {
+  dragPtr = { id: e.pointerId, x: e.clientX, y: e.clientY, yaw: cubeYaw, pitch: cubePitch };
+  cubeCanvas.setPointerCapture(e.pointerId);
+});
+cubeCanvas.addEventListener('pointermove', e => {
+  if (!dragPtr || dragPtr.id !== e.pointerId) return;
+  cubeYaw = dragPtr.yaw + (e.clientX - dragPtr.x) * 0.012;
+  cubePitch = Math.max(-1.45, Math.min(1.45, dragPtr.pitch + (e.clientY - dragPtr.y) * 0.012));
+  render3DCube();
+});
+cubeCanvas.addEventListener('pointerup', e => {
+  if (dragPtr && dragPtr.id === e.pointerId) dragPtr = null;
+});
+for (const btn of document.querySelectorAll('[data-cube-view]')) {
+  btn.addEventListener('click', () => {
+    const v = btn.dataset.cubeView;
+    if (v === 'iso') { cubeYaw = -0.58; cubePitch = 0.44; }
+    else if (v === 'front') { cubeYaw = 0.0; cubePitch = 0.0; }
+    else if (v === 'back') { cubeYaw = Math.PI; cubePitch = 0.0; }
+    else if (v === 'top') { cubeYaw = 0.0; cubePitch = 1.15; }
+    else if (v === 'bottom') { cubeYaw = 0.0; cubePitch = -1.15; }
+    render3DCube();
+  });
+}
+
+function renderCubeUI(state) {
+  cubeState = state;
+  const live = state?.live || {};
+  const val = state?.validation || {};
+
+  if (live.detected) {
+    const pct = Math.round((live.confidence || 0) * 100);
+    const pos = live.estimated_pose?.position_m;
+    const poseTxt = pos ? ` · est (${pos[0].toFixed(2)}, ${pos[1].toFixed(2)}, ${pos[2].toFixed(2)}) m` : '';
+    cubeDetectBadge.textContent = `Detected (${pct}%)${poseTxt}`;
+    cubeDetectBadge.className = 'cube-badge ok';
+  } else {
+    cubeDetectBadge.textContent = 'No cube detected';
+    cubeDetectBadge.className = 'cube-badge';
+  }
+
+  const miniCells = cubeLiveMini.children;
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      const code = live.grid?.[r]?.[c] || '?';
+      const cell = miniCells[r * 3 + c];
+      cell.textContent = code;
+      cell.style.background = CUBE_PALETTE[code] || CUBE_PALETTE['?'];
+      cell.style.color = CUBE_TEXT[code] || CUBE_TEXT['?'];
+    }
+  }
+
+  cubeNetEl.replaceChildren();
+  for (const [faceKey, colPos, rowPos] of NET_LAYOUT) {
+    const faceEntry = state?.faces?.[faceKey];
+    const grid = faceEntry?.grid || [['?','?','?'],['?','?','?'],['?','?','?']];
+    const box = document.createElement('div');
+    box.className = 'net-face' + (selectedCubeFace === faceKey ? ' active' : '');
+    box.style.gridColumn = String(colPos);
+    box.style.gridRow = String(rowPos);
+    box.addEventListener('click', () => {
+      selectedCubeFace = faceKey;
+      renderCubeUI(cubeState);
+    });
+    const lbl = document.createElement('div');
+    lbl.className = 'net-face-label';
+    lbl.textContent = faceKey + (faceEntry?.scanned ? ' ✓' : '');
+    const gEl = document.createElement('div');
+    gEl.className = 'net-grid';
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        const code = grid[r][c] || '?';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'net-cell';
+        btn.textContent = code;
+        btn.title = `${faceKey}[${r},${c}] = ${code} (click to cycle)`;
+        btn.style.background = CUBE_PALETTE[code] || CUBE_PALETTE['?'];
+        btn.style.color = CUBE_TEXT[code] || CUBE_TEXT['?'];
+        btn.addEventListener('click', async e => {
+          e.stopPropagation();
+          selectedCubeFace = faceKey;
+          const next = CUBE_CYCLE[(CUBE_CYCLE.indexOf(code) + 1) % CUBE_CYCLE.length];
+          await postCubeAction('/api/cube/sticker', { face: faceKey, row: r, col: c, color: next });
+        });
+        gEl.append(btn);
+      }
+    }
+    box.append(lbl, gEl);
+    cubeNetEl.append(box);
+  }
+
+  const sf = val.scanned_faces ?? 0;
+  const ks = val.known_stickers ?? 0;
+  cubeValBadge.textContent = `${sf}/6 faces · ${ks}/54 stickers` + (val.ready_to_solve ? ' · Ready' : '');
+  cubeValBadge.className = 'cube-badge' + (val.ready_to_solve ? ' ok' : (val.issues?.length ? ' warn' : ''));
+  if (val.color_counts) {
+    cubeCountsEl.textContent = Object.entries(val.color_counts).map(([k, v]) => `${k}:${v}`).join(' ');
+  }
+  cubeIssuesEl.textContent = (val.issues && val.issues.length) ? val.issues.join(' · ') : '';
+
+  cubeClaudeBtn.disabled = !state?.claude_scan_ready;
+  render3DCube();
+  redrawAllFeedOverlays();
+}
+
+async function postCubeAction(endpoint, payload) {
+  try {
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Cube update failed.');
+    renderCubeUI(d.state || d);
+    return d;
+  } catch (err) {
+    cubeStatusEl.textContent = err.message;
+    return null;
+  }
+}
+
+async function refreshCubeState() {
+  try {
+    const r = await fetch('/api/cube/state');
+    if (r.ok) renderCubeUI(await r.json());
+  } catch (_) {}
+}
+
+async function stepLiveCubeDetection() {
+  if (!cubeLiveCheck.checked || cubeDetectInFlight || !cameraSocket) return;
+  const mode = cubeCamSelect.value;
+  let chosen = null;
+  if (mode === 'auto') {
+    const available = [...feeds.values()].filter(f => Boolean(f.latestB64));
+    if (!available.length) return;
+    // Prefer whichever feed currently detects the cube; otherwise cycle round-robin
+    const currentSrc = cubeState?.live?.detected ? cubeState.live.source : '';
+    chosen = available.find(f => f.topic === currentSrc) || available[cubeAutoIndex % available.length];
+    if (!cubeState?.live?.detected) cubeAutoIndex++;
+  } else {
+    const f = feeds.get(mode);
+    if (f && f.latestB64) chosen = f;
+  }
+  if (!chosen) return;
+  cubeDetectInFlight = true;
+  try {
+    const r = await fetch('/api/cube/detect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_b64: chosen.latestB64, source: chosen.topic })
+    });
+    if (r.ok) renderCubeUI(await r.json());
+  } catch (_) {
+  } finally {
+    cubeDetectInFlight = false;
+  }
+}
+
+document.getElementById('cube-capture-btn').addEventListener('click', async () => {
+  const face = cubeTargetFace.value;
+  const res = await postCubeAction('/api/cube/capture', { face });
+  if (res?.captured_face) {
+    selectedCubeFace = res.captured_face;
+    renderCubeUI(res.state);
+    cubeStatusEl.textContent = `Captured live grid onto face ${res.captured_face}.`;
+  }
+});
+
+document.getElementById('cube-rotate-btn').addEventListener('click', async () => {
+  const res = await postCubeAction('/api/cube/rotate', { face: selectedCubeFace, turns: 1 });
+  if (res) cubeStatusEl.textContent = `Rotated face ${selectedCubeFace} by 90° clockwise.`;
+});
+
+document.getElementById('cube-reset-btn').addEventListener('click', async () => {
+  const res = await postCubeAction('/api/cube/reset', {});
+  if (res) cubeStatusEl.textContent = 'Reset all 6 faces of the 3D cube model.';
+});
+
+cubeClaudeBtn.addEventListener('click', async () => {
+  const images = {};
+  for (const feed of feeds.values()) {
+    if (feed.latestB64) images[feed.label] = feed.latestB64;
+  }
+  cubeClaudeBtn.disabled = true;
+  cubeStatusEl.textContent = 'Scanning visible faces with Claude Vision…';
+  try {
+    const r = await fetch('/api/cube/claude-scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ images_b64: images, auto_capture: true })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Claude cube scan failed.');
+    if (d.state) renderCubeUI(d.state);
+    const scannedKeys = Object.keys(d.scan?.faces || {});
+    cubeStatusEl.textContent = scannedKeys.length
+      ? `Claude read face(s): ${scannedKeys.join(', ')}. ${d.scan.reason || ''}`
+      : `No faces read by Claude. ${d.scan?.reason || ''}`;
+  } catch (err) {
+    cubeStatusEl.textContent = err.message;
+  } finally {
+    refreshCubeState();
+  }
+});
+
+setInterval(stepLiveCubeDetection, 400);
+setInterval(refreshCubeState, 1200);
+refreshCubeState();
+
 setInterval(poll, 1000);
 poll();
 </script>
@@ -1140,6 +1695,13 @@ def start_console_http_server(
             ):
                 raise PermissionError("This request must come from the local console.")
 
+        def _cube_snapshot(self) -> dict[str, Any]:
+            snap = prompt_ctrl.cube_state.snapshot()
+            snap["claude_scan_ready"] = bool(
+                key_planner.api_key if key_planner is not None else load_anthropic_api_key(None)
+            )
+            return snap
+
         def do_GET(self) -> None:
             if self.path == "/api/status":
                 data = prompt_ctrl.snapshot()
@@ -1151,6 +1713,9 @@ def start_console_http_server(
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if self.path == "/api/cube/state":
+                self.reply_json(200, self._cube_snapshot())
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1227,6 +1792,79 @@ def start_console_http_server(
                     result = {"error": str(exc)}
                     status = 409
                 self.reply_json(status, result)
+                return
+            if self.path.startswith("/api/cube/"):
+                try:
+                    if self.path == "/api/cube/claude-scan" and key_planner is not None:
+                        self.require_local_json()
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length < 0 or length > 4 * 1024 * 1024:
+                        raise ValueError("Cube request body exceeds 4 MiB limit.")
+                    raw = self.rfile.read(length) if length > 0 else b"{}"
+                    req_obj = json.loads(raw.decode("utf-8"))
+                    if not isinstance(req_obj, dict):
+                        raise ValueError("Expected a JSON object.")
+
+                    if self.path == "/api/cube/detect":
+                        img_b64 = req_obj.get("image_b64", "")
+                        source_name = str(req_obj.get("source", ""))
+                        det = detect_cube_cv(img_b64, source=source_name)
+                        prompt_ctrl.cube_state.update_live(det, source=source_name)
+                        self.reply_json(200, self._cube_snapshot())
+                    elif self.path == "/api/cube/capture":
+                        cap = prompt_ctrl.cube_state.capture_face(
+                            face=req_obj.get("face"),
+                            grid=req_obj.get("grid"),
+                            source=str(req_obj.get("source", "")),
+                        )
+                        cap["state"]["claude_scan_ready"] = self._cube_snapshot()["claude_scan_ready"]
+                        self.reply_json(200, cap)
+                    elif self.path == "/api/cube/rotate":
+                        state = prompt_ctrl.cube_state.rotate_face(
+                            str(req_obj["face"]), int(req_obj.get("turns", 1))
+                        )
+                        state["claude_scan_ready"] = self._cube_snapshot()["claude_scan_ready"]
+                        self.reply_json(200, {"state": state})
+                    elif self.path == "/api/cube/sticker":
+                        state = prompt_ctrl.cube_state.set_sticker(
+                            str(req_obj["face"]),
+                            int(req_obj["row"]),
+                            int(req_obj["col"]),
+                            str(req_obj["color"]),
+                        )
+                        state["claude_scan_ready"] = self._cube_snapshot()["claude_scan_ready"]
+                        self.reply_json(200, {"state": state})
+                    elif self.path == "/api/cube/reset":
+                        prompt_ctrl.cube_state.reset()
+                        self.reply_json(200, {"state": self._cube_snapshot()})
+                    elif self.path == "/api/cube/claude-scan":
+                        images = req_obj.get("images_b64")
+                        if not isinstance(images, dict) or not any(images.values()):
+                            images = {
+                                k: v for k, v in prompt_ctrl.snapshot().get("images_b64", {}).items() if v
+                            }
+                        if not images:
+                            raise ValueError("No camera images available for Claude scan.")
+                        api_key = key_planner.api_key if key_planner is not None else None
+                        model = key_planner.model if key_planner is not None else None
+                        scan = scan_cube_with_claude(images, api_key=api_key, model=model)
+                        if req_obj.get("auto_capture", True) and scan.get("faces"):
+                            for fkey, fgrid in scan["faces"].items():
+                                prompt_ctrl.cube_state.capture_face(
+                                    face=fkey,
+                                    grid=fgrid,
+                                    source="claude",
+                                    confidence=scan.get("confidence", 0.85),
+                                )
+                        self.reply_json(200, {"scan": scan, "state": self._cube_snapshot()})
+                    else:
+                        self.reply_json(404, {"error": "Unknown cube endpoint."})
+                except PermissionError as exc:
+                    self.reply_json(403, {"error": str(exc)})
+                except (ValueError, KeyError, TypeError) as exc:
+                    self.reply_json(400, {"error": str(exc)})
+                except Exception as exc:
+                    self.reply_json(502, {"error": f"{type(exc).__name__}: {exc}"})
                 return
             if self.path == "/api/prompt":
                 if not prompts_enabled:
