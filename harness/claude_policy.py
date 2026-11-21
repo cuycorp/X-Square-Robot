@@ -283,6 +283,20 @@ class ClaudeEndPosePlanner:
         self._waypoints: list[dict[str, Any]] = []
         self._waypoint_index = 0
 
+    def _pick_available_model(self, key: str) -> str | None:
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/models",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+        )
+        with urllib.request.urlopen(req, timeout=min(self.timeout_s, 8)) as resp:
+            payload = json.load(resp)
+        ids = [str(item.get("id", "")) for item in payload.get("data", []) if item.get("id")]
+        for prefix in ("claude-sonnet", "claude-3-7-sonnet", "claude-3-5-sonnet", "claude-opus", "claude-"):
+            for mid in ids:
+                if mid.startswith(prefix):
+                    return mid
+        return ids[0] if ids else None
+
     def configure_api_key(self, key: str) -> None:
         """Check model access with a metadata request before accepting the session key."""
         key = key.strip()
@@ -297,7 +311,18 @@ class ClaudeEndPosePlanner:
             with urllib.request.urlopen(request, timeout=min(self.timeout_s, 8)):
                 pass
         except urllib.error.HTTPError as error:
-            raise ValueError(f"Anthropic couldn't verify model access (HTTP {error.code}).") from error
+            if error.code == 404:
+                try:
+                    fallback = self._pick_available_model(key)
+                except urllib.error.HTTPError as list_err:
+                    raise ValueError(f"Anthropic couldn't verify the API key (HTTP {list_err.code}).") from list_err
+                except OSError as net_err:
+                    raise RuntimeError("Could not reach the Anthropic API to verify the key.") from net_err
+                if not fallback:
+                    raise ValueError(f"Anthropic couldn't verify model access (HTTP {error.code}).") from error
+                self.model = fallback
+            else:
+                raise ValueError(f"Anthropic couldn't verify model access (HTTP {error.code}).") from error
         except OSError as error:
             raise RuntimeError("Could not reach the Anthropic API to verify the key.") from error
         self.api_key = key

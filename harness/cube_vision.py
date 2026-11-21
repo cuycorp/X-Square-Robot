@@ -9,6 +9,7 @@ import base64
 import io
 import json
 import math
+import urllib.error
 import urllib.request
 from collections import deque
 from typing import Any
@@ -329,6 +330,45 @@ def _estimate_pose(quad: np.ndarray, w_img: int, h_img: int) -> dict[str, Any]:
     }
 
 
+def _blobs_compatible(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Check spatial proximity and sticker size/shape compatibility."""
+    sa = float(max(a["bw"], a["bh"]))
+    sb = float(max(b["bw"], b["bh"]))
+    if max(sa, sb) / max(1.0, min(sa, sb)) > 2.2:
+        return False
+    area_ratio = max(a["area"], b["area"]) / max(1.0, min(a["area"], b["area"]))
+    if area_ratio > 3.2:
+        return False
+    asp_a = max(a["bw"], a["bh"]) / max(1.0, min(a["bw"], a["bh"]))
+    asp_b = max(b["bw"], b["bh"]) / max(1.0, min(b["bw"], b["bh"]))
+    if max(asp_a, asp_b) / max(1.0, min(asp_a, asp_b)) > 1.9:
+        return False
+    dist = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"])
+    return dist <= max(12.0, 3.6 * max(sa, sb))
+
+
+def _cluster_compatible_blobs(blobs: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    n = len(blobs)
+    visited = [False] * n
+    groups: list[list[dict[str, Any]]] = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        q = deque([i])
+        visited[i] = True
+        group: list[dict[str, Any]] = []
+        while q:
+            idx = q.popleft()
+            bi = blobs[idx]
+            group.append(bi)
+            for j in range(n):
+                if not visited[j] and _blobs_compatible(bi, blobs[j]):
+                    visited[j] = True
+                    q.append(j)
+        groups.append(group)
+    return groups
+
+
 def detect_cube_cv(
     image_input: bytes | str | Image.Image,
     *,
@@ -338,7 +378,8 @@ def detect_cube_cv(
     """Detect a Rubik's cube face and extract its 3x3 sticker grid + quad."""
     img = _decode_image(image_input)
     orig_w, orig_h = img.size
-    scale = min(1.0, 320.0 / max(orig_w, orig_h))
+    target_max = 640.0
+    scale = min(1.0, target_max / max(orig_w, orig_h))
     work_w = max(32, int(round(orig_w * scale)))
     work_h = max(32, int(round(orig_h * scale)))
     work_img = img.resize((work_w, work_h), Image.BILINEAR) if scale < 1.0 else img
@@ -346,93 +387,87 @@ def detect_cube_cv(
     rgb = np.asarray(work_img, dtype=np.uint8)
     _h, s, v = _rgb_to_hsv_np(rgb)
     img_area = work_w * work_h
+    min_sticker_area = max(12.0, 0.00008 * img_area)
+    max_sticker_area = 0.20 * img_area
 
-    chrom_mask = (s >= 0.28) & (v >= 0.20)
-    white_mask = (s <= 0.24) & (v >= 0.65)
-
-    chrom_blobs_all = _connected_blobs(chrom_mask, use_cv2=use_cv2)
-    sticker_blobs = [
-        b for b in chrom_blobs_all
-        if 0.00045 * img_area <= b["area"] <= 0.20 * img_area
-        and (b["area"] / max(1, b["bw"] * b["bh"])) >= 0.38
-    ]
-
+    white_mask = (s <= 0.30) & (v >= 0.42)
+    white_blobs_all: list[dict[str, Any]] | None = None
     cluster_blobs: list[dict[str, Any]] = []
-    white_blobs_all: list[dict[str, Any]] = []
+    chrom_blobs_all: list[dict[str, Any]] = []
 
-    if len(sticker_blobs) >= 2:
-        sizes = [min(b["bw"], b["bh"]) for b in sticker_blobs]
-        med_size = float(np.median(sizes))
-        dist_thresh = max(14.0, 3.8 * med_size)
+    for s_min, v_min in ((0.18, 0.14), (0.12, 0.12)):
+        chrom_mask = (s >= s_min) & (v >= v_min)
+        chrom_blobs_all = _connected_blobs(chrom_mask, use_cv2=use_cv2)
+        sticker_blobs = [
+            b for b in chrom_blobs_all
+            if min_sticker_area <= b["area"] <= max_sticker_area
+            and (b["area"] / max(1, b["bw"] * b["bh"])) >= 0.35
+            and max(b["bw"], b["bh"]) / max(1, min(b["bw"], b["bh"])) <= 3.2
+        ]
+        if len(sticker_blobs) >= 2:
+            best_group: list[dict[str, Any]] = []
+            best_score = -1.0
+            for group in _cluster_compatible_blobs(sticker_blobs):
+                if len(group) < 2:
+                    continue
+                xs0 = [g["bbox"][0] for g in group]
+                ys0 = [g["bbox"][1] for g in group]
+                xs1 = [g["bbox"][2] for g in group]
+                ys1 = [g["bbox"][3] for g in group]
+                span_w = max(xs1) - min(xs0)
+                span_h = max(ys1) - min(ys0)
+                span = max(span_w, span_h, 1)
+                density = sum(g["area"] for g in group) / float(span * span)
+                aspect_penalty = max(span_w, span_h) / max(1.0, min(span_w, span_h))
+                eff_count = min(len(group), 9)
+                score = eff_count * 1.8 + density * 4.5 - max(0.0, aspect_penalty - 1.35) * 2.0
+                if score > best_score:
+                    best_score = score
+                    best_group = group
+            if best_group:
+                cluster_blobs = list(best_group)
+                c_xs0 = min(b["bbox"][0] for b in cluster_blobs)
+                c_ys0 = min(b["bbox"][1] for b in cluster_blobs)
+                c_xs1 = max(b["bbox"][2] for b in cluster_blobs)
+                c_ys1 = max(b["bbox"][3] for b in cluster_blobs)
+                unit_s = float(np.median([max(b["bw"], b["bh"]) for b in cluster_blobs]))
+                med_area = float(np.median([b["area"] for b in cluster_blobs]))
+                pad = max(8.0, 1.3 * unit_s)
 
-        n = len(sticker_blobs)
-        visited = [False] * n
-        best_group: list[dict[str, Any]] = []
-        best_score = -1.0
-        for i in range(n):
-            if visited[i]:
-                continue
-            q = deque([i])
-            visited[i] = True
-            group = []
-            while q:
-                idx = q.popleft()
-                b = sticker_blobs[idx]
-                group.append(b)
-                for j in range(n):
-                    if not visited[j]:
-                        bj = sticker_blobs[j]
-                        d = math.hypot(b["cx"] - bj["cx"], b["cy"] - bj["cy"])
-                        if d <= dist_thresh:
-                            visited[j] = True
-                            q.append(j)
-            xs0 = [g["bbox"][0] for g in group]
-            ys0 = [g["bbox"][1] for g in group]
-            xs1 = [g["bbox"][2] for g in group]
-            ys1 = [g["bbox"][3] for g in group]
-            span = max(max(xs1) - min(xs0), max(ys1) - min(ys0), 1)
-            density = sum(g["area"] for g in group) / float(span * span)
-            score = len(group) * 1.5 + density * 4.0
-            if len(group) >= 2 and score > best_score:
-                best_score = score
-                best_group = group
-        cluster_blobs = best_group
+                if white_blobs_all is None:
+                    white_blobs_all = _connected_blobs(white_mask, use_cv2=use_cv2)
+                for wb in white_blobs_all:
+                    if not (min_sticker_area <= wb["area"] <= 0.06 * img_area):
+                        continue
+                    if max(wb["bw"], wb["bh"]) / max(1, min(wb["bw"], wb["bh"])) > 2.2:
+                        continue
+                    if wb["area"] / max(1, wb["bw"] * wb["bh"]) < 0.45:
+                        continue
+                    if (c_xs0 - pad <= wb["cx"] <= c_xs1 + pad) and (c_ys0 - pad <= wb["cy"] <= c_ys1 + pad):
+                        if 0.4 * med_area <= wb["area"] <= 2.2 * med_area and max(wb["bw"], wb["bh"]) <= 1.8 * unit_s:
+                            cluster_blobs.append(wb)
+                if len(cluster_blobs) >= 3:
+                    break
 
-        if cluster_blobs:
-            c_xs0 = min(b["bbox"][0] for b in cluster_blobs)
-            c_ys0 = min(b["bbox"][1] for b in cluster_blobs)
-            c_xs1 = max(b["bbox"][2] for b in cluster_blobs)
-            c_ys1 = max(b["bbox"][3] for b in cluster_blobs)
-            unit_s = float(np.median([min(b["bw"], b["bh"]) for b in cluster_blobs]))
-            pad = max(12.0, 2.6 * unit_s)
-
+    if len(cluster_blobs) < 3:
+        if white_blobs_all is None:
             white_blobs_all = _connected_blobs(white_mask, use_cv2=use_cv2)
-            for wb in white_blobs_all:
-                if not (0.00045 * img_area <= wb["area"] <= 0.06 * img_area):
-                    continue
-                if max(wb["bw"], wb["bh"]) / max(1, min(wb["bw"], wb["bh"])) > 2.2:
-                    continue
-                if wb["area"] / max(1, wb["bw"] * wb["bh"]) < 0.45:
-                    continue
-                if (c_xs0 - pad <= wb["cx"] <= c_xs1 + pad) and (c_ys0 - pad <= wb["cy"] <= c_ys1 + pad):
-                    if min(wb["bw"], wb["bh"]) <= 2.4 * unit_s:
-                        cluster_blobs.append(wb)
-    else:
-        white_blobs_all = _connected_blobs(white_mask, use_cv2=use_cv2)
         cand = [
             wb for wb in white_blobs_all
-            if 0.0005 * img_area <= wb["area"] <= 0.045 * img_area
+            if min_sticker_area <= wb["area"] <= 0.045 * img_area
             and max(wb["bw"], wb["bh"]) / max(1, min(wb["bw"], wb["bh"])) <= 1.8
             and (wb["area"] / max(1, wb["bw"] * wb["bh"])) >= 0.55
         ]
-        if len(cand) >= 6:
-            cluster_blobs = cand
+        if len(cand) >= 4:
+            groups = [g for g in _cluster_compatible_blobs(cand) if len(g) >= 4]
+            if groups:
+                cluster_blobs = max(groups, key=len)
 
     used_merged_blob = False
     if len(cluster_blobs) < 3:
         merged_cands = [
             b for b in chrom_blobs_all
-            if 0.008 * img_area <= b["area"] <= 0.35 * img_area
+            if 0.002 * img_area <= b["area"] <= 0.35 * img_area
             and max(b["bw"], b["bh"]) / max(1, min(b["bw"], b["bh"])) <= 1.65
             and (b["area"] / max(1, b["bw"] * b["bh"])) >= 0.45
         ]
@@ -465,7 +500,7 @@ def detect_cube_cv(
 
     top_w = float(np.linalg.norm(quad[1] - quad[0]))
     left_h = float(np.linalg.norm(quad[3] - quad[0]))
-    if top_w < 18 or left_h < 18 or max(top_w, left_h) / max(1.0, min(top_w, left_h)) > 1.85:
+    if top_w < 14 or left_h < 14 or max(top_w, left_h) / max(1.0, min(top_w, left_h)) > 1.85:
         return {
             "detected": False,
             "confidence": 0.0,
@@ -585,25 +620,46 @@ def scan_cube_with_claude(
             "source": {"type": "base64", "media_type": "image/jpeg", "data": clean.strip()},
         })
 
-    url = (base_url or "https://api.anthropic.com").rstrip("/") + "/v1/messages"
-    body = {
-        "model": model or DEFAULT_CLAUDE_MODEL,
-        "max_tokens": 768,
-        "system": CLAUDE_CUBE_PROMPT,
-        "messages": [{"role": "user", "content": content}],
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        payload = json.load(resp)
+    base = (base_url or "https://api.anthropic.com").rstrip("/")
+    url = base + "/v1/messages"
+    chosen_model = model or DEFAULT_CLAUDE_MODEL
+
+    def _post(m: str) -> dict[str, Any]:
+        body = {
+            "model": m,
+            "max_tokens": 768,
+            "system": CLAUDE_CUBE_PROMPT,
+            "messages": [{"role": "user", "content": content}],
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return json.load(resp)
+
+    try:
+        payload = _post(chosen_model)
+    except urllib.error.HTTPError as err:
+        if err.code != 404 or model:
+            raise
+        models_req = urllib.request.Request(
+            base + "/v1/models",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+        )
+        with urllib.request.urlopen(models_req, timeout=min(timeout_s, 8.0)) as mresp:
+            mdata = json.load(mresp)
+        ids = [str(item.get("id", "")) for item in mdata.get("data", []) if item.get("id")]
+        fallback = next((mid for p in ("claude-sonnet", "claude-3-7-sonnet", "claude-3-5-sonnet", "claude-") for mid in ids if mid.startswith(p)), ids[0] if ids else "")
+        if not fallback:
+            raise
+        payload = _post(fallback)
 
     text_parts = [blk.get("text", "") for blk in payload.get("content", []) if blk.get("type") == "text"]
     parsed = extract_json_object("\n".join(text_parts))

@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from claude_policy import ClaudeEndPosePlanner, load_anthropic_api_key
 from kinematics import arm_chain, jog_target
 from server import PromptController, start_console_http_server
 
@@ -161,10 +162,12 @@ def main() -> None:
         timer.start()
         return "Manual SDK server is stopping. Wait for the robot to return to idle before starting evaluation."
 
+    key_planner = ClaudeEndPosePlanner(api_key=load_anthropic_api_key())
     server = start_console_http_server(
         "127.0.0.1", args.port, PromptController(),
         live_jog=jogger, live_action=jogger.action if jogger else None,
         release_manual=release_manual if jogger else None, prompts_enabled=False,
+        key_planner=key_planner,
     )
     print(f"Console at http://127.0.0.1:{server.server_port}/", flush=True)
     try:

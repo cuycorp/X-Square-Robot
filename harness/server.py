@@ -1131,7 +1131,11 @@ function updatePromptAvailability() {
   for (const input of promptForm.elements) input.disabled = !promptsEnabled || !keyReady;
 }
 updatePromptAvailability();
-if (!keyReady) keyStatus.textContent = 'Verify an Anthropic key to enable prompts.';
+if (!keyReady) {
+  keyStatus.textContent = promptsEnabled
+    ? 'Verify an Anthropic key to enable prompts and Scan with Claude.'
+    : 'Verify an Anthropic key to enable Scan with Claude.';
+}
 if (!keyForm.hidden) document.getElementById('use-webui-case').hidden = true;
 if (!promptsEnabled) {
   document.getElementById('prompt-status').textContent = manualPromptMessage;
@@ -1153,6 +1157,7 @@ keyForm.addEventListener('submit', async event => {
     input.value = '';
     keyStatus.textContent = 'Anthropic accepted the key. It is held in memory for this session.';
     updatePromptAvailability();
+    refreshCubeState();
   } catch (error) {
     keyStatus.textContent = error.message;
   } finally {
@@ -1176,7 +1181,9 @@ async function poll() {
     policyConnected = d.connected;
     if (typeof d.key_ready === 'boolean' && keyReady !== d.key_ready) {
       keyReady = d.key_ready;
-      keyStatus.textContent = keyReady ? 'Anthropic key configured.' : 'Verify an Anthropic key to enable prompts.';
+      keyStatus.textContent = keyReady
+        ? 'Anthropic key configured.'
+        : (promptsEnabled ? 'Verify an Anthropic key to enable prompts and Scan with Claude.' : 'Verify an Anthropic key to enable Scan with Claude.');
       updatePromptAvailability();
     }
     document.getElementById('conn').textContent = promptsEnabled
@@ -1455,14 +1462,15 @@ function renderCubeUI(state) {
   const live = state?.live || {};
   const val = state?.validation || {};
 
+  const srcLabel = feeds.get(live.source)?.label || live.source || '';
   if (live.detected) {
     const pct = Math.round((live.confidence || 0) * 100);
     const pos = live.estimated_pose?.position_m;
     const poseTxt = pos ? ` · est (${pos[0].toFixed(2)}, ${pos[1].toFixed(2)}, ${pos[2].toFixed(2)}) m` : '';
-    cubeDetectBadge.textContent = `Detected (${pct}%)${poseTxt}`;
+    cubeDetectBadge.textContent = `Detected (${pct}%)${srcLabel ? ' · ' + srcLabel : ''}${poseTxt}`;
     cubeDetectBadge.className = 'cube-badge ok';
   } else {
-    cubeDetectBadge.textContent = 'No cube detected';
+    cubeDetectBadge.textContent = srcLabel ? `Scanning ${srcLabel} · no cube yet` : 'No cube detected';
     cubeDetectBadge.className = 'cube-badge';
   }
 
@@ -1527,6 +1535,11 @@ function renderCubeUI(state) {
   cubeIssuesEl.textContent = (val.issues && val.issues.length) ? val.issues.join(' · ') : '';
 
   cubeClaudeBtn.disabled = !state?.claude_scan_ready;
+  cubeClaudeBtn.title = state?.claude_scan_ready
+    ? 'Send current camera frames to Claude Vision'
+    : (keyForm.hidden
+      ? 'Set ANTHROPIC_API_KEY on host or launch with --console-host 127.0.0.1 to enter a key'
+      : 'Verify an Anthropic API key in the sidebar first');
   render3DCube();
   redrawAllFeedOverlays();
 }
@@ -1960,12 +1973,13 @@ def main() -> None:
     else:
         planner = ClaudeEndPosePlanner(model=args.model or None, plan_every=args.plan_every)
 
-    key_planner = planner if args.local_key_setup and isinstance(planner, ClaudeEndPosePlanner) else None
+    console_key_planner = planner if console_host == "127.0.0.1" and isinstance(planner, ClaudeEndPosePlanner) else None
+    ws_key_planner = planner if args.local_key_setup and isinstance(planner, ClaudeEndPosePlanner) else None
     if args.console_port > 0:
-        start_console_http_server(console_host, args.console_port, ctrl, key_planner=key_planner)
+        start_console_http_server(console_host, args.console_port, ctrl, key_planner=console_key_planner)
     limits = WorkspaceLimits(max_step_pos_m=args.max_step_m, max_step_rot_rad=args.max_step_rad)
     engine = DualArmPolicyEngine(planner=planner, limits=limits, log_path=Path(args.log_file), prompt_ctrl=ctrl)
-    asyncio.run(run_server(args.host, args.port, engine, key_planner=key_planner, robot_ip=args.robot_ip))
+    asyncio.run(run_server(args.host, args.port, engine, key_planner=ws_key_planner, robot_ip=args.robot_ip))
 
 
 if __name__ == "__main__":

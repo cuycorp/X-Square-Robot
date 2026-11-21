@@ -114,6 +114,43 @@ class TestCubeVision(unittest.TestCase):
                     self.assertEqual(len(res["quad"]), 4)
                     self.assertEqual(res["estimated_pose"]["frame"], "camera_optical_uncalibrated")
 
+    def test_detects_small_48px_tabletop_and_low_saturation_cube(self) -> None:
+        grid = [["W", "R", "G"], ["B", "Y", "O"], ["G", "W", "R"]]
+        # 48px cube at 640x480 (realistic wide-angle robot head camera scale)
+        small_img = render_cube_image(grid, size=48.0, angle_deg=15.0, clutter=True)
+        for use_cv2 in (True, False):
+            res = detect_cube_cv(small_img, source="front", use_cv2=use_cv2)
+            self.assertTrue(res["detected"], f"Failed small_48px with use_cv2={use_cv2}")
+            self.assertEqual(res["grid"], grid)
+
+        # Low-saturation washed-out lighting render
+        washed = Image.blend(
+            render_cube_image(grid, size=90.0, angle_deg=-8.0, bg=(140, 140, 140)),
+            Image.new("RGB", (640, 480), (175, 175, 175)),
+            alpha=0.45,
+        )
+        res_w = detect_cube_cv(washed, source="front", use_cv2=True)
+        self.assertTrue(res_w["detected"])
+
+    def test_configure_api_key_falls_back_on_404_model(self) -> None:
+        planner = ClaudeEndPosePlanner(model="claude-sonnet-5-5")
+        err404 = urllib.error.HTTPError("https://api.anthropic.com/v1/models/claude-sonnet-5-5", 404, "Not Found", {}, None)
+
+        class FakeModelsResp:
+            def read(self) -> bytes:
+                return json.dumps({"data": [{"id": "claude-sonnet-4-5-20250929"}]}).encode("utf-8")
+
+            def __enter__(self) -> "FakeModelsResp":
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                return None
+
+        with patch("claude_policy.urllib.request.urlopen", side_effect=[err404, FakeModelsResp()]):
+            planner.configure_api_key("sk-ant-valid-key-123456")
+        self.assertEqual(planner.api_key, "sk-ant-valid-key-123456")
+        self.assertEqual(planner.model, "claude-sonnet-4-5-20250929")
+
     def test_no_cube_returns_undetected(self) -> None:
         img = Image.new("RGB", (640, 480), (95, 92, 88))
         draw = ImageDraw.Draw(img)
