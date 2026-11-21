@@ -74,8 +74,8 @@ def check(path: Path) -> list[str]:
         if not isinstance(t, (int, float)) or t <= 0:
             errs.append(f"{p}.timeout must be a positive number of seconds")
         img = case.get("image_path", "")
-        if img and not img.startswith("http") and not (Path("/home/xr/diversity") / img).exists():
-            warns.append(f"{p}.image_path '{img}' not found under /home/xr/diversity/")
+        if img and not img.startswith("http"):
+            warns.append(f"{p}.image_path '{img}' must also be copied to the robot: /home/xr/diversity/{img}")
         if not isinstance(case.get("env_description", {}), dict):
             errs.append(f"{p}.env_description must be an object")
     return [f"ERROR {e}" for e in errs] + [f"WARN  {w}" for w in warns]

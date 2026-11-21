@@ -1,76 +1,72 @@
 ---
 name: robot-harness
-description: Set up, test, run and extend the synchronous WALLX WebSocket harness (harness/harness.py) that sits between the robot client and the WALLX VLA API, including the vision Agent that rewrites sub-instructions. Use for passthrough tests, agent integration, replanning logic, logs, or harness errors.
+description: Run, test and extend harness/harness.py, the relay between the robot client and Wall-X, including typed-command override, the browser dashboard (cameras, arm state, latency) and the optional vision agent. Use for passthrough runs, harness code changes, GUI work, logs, or harness errors.
 ---
 
-# WALLX harness
+# Harness: robot client ⇄ laptop ⇄ Wall-X
 
-Architecture: `robot client (x2robot_infer_node) ──ws──> harness (this repo) ──wss──> WALLX API`.
-The client captures 3 cameras + arm state, sends a `public_v2` request, executes returned actions.
-The harness may change **only `instruction`**; everything else (observation, control_context,
-metadata, model reply bytes) is forwarded unchanged.
-
-## One-time setup
-```bash
-# python3.12-venv (ensurepip) is NOT installed on this host and sudo needs a password,
-# so create the venv without pip and drive it with the system pip. Never pip-install into
-# the system python3 — the ROS robot nodes use it.
-python3 -m venv --without-pip .venv
-python3 -m pip --python .venv/bin/python install -r harness/requirements.txt
-(cd harness && ../.venv/bin/python -m unittest -v test_harness.py)   # offline, no robot/API
 ```
-Auth headers file (key comes from the user or from the WebUI override — never echo it):
-```bash
-mkdir -p ~/.config/wallx && umask 077
-python3 - <<'EOF'
-import json, pathlib
-o = json.load(open("/home/xr/diversity/local/state/model_overrides.json"))
-key = next(v["infer_params"]["async_params"].get("api_key") for v in o.values()
-           if v.get("infer_params", {}).get("async_params", {}).get("api_key"))
-p = pathlib.Path.home()/".config/wallx/headers.json"
-p.write_text(json.dumps({"Authorization": f"Bearer {key}"})); p.chmod(0o600)
-print("wrote", p)
-EOF
+robot client (192.168.77.2) ──ws──▶ harness.py on 192.168.77.18:8001 ──ws/wss──▶ Wall-X
+                                      └─ GUI on 127.0.0.1:8080 (cameras, state, command box)
 ```
-Env: `export WALLX_ENDPOINT=wss://maas-api.x2robot.com/v1/vla/wallx WALLX_HEADERS_FILE=~/.config/wallx/headers.json`
 
-Check WALLX reachability first with the `wallx-api` skill's probe (handshake only, no motion).
+The robot client captures the 3 cameras and arm state, sends a `public_v2` request, and executes the
+32-frame reply. The harness **changes only `instruction`**. Observation, `control_context`, handshake
+and the model reply pass through unchanged: frames are forwarded as-is unless the instruction changes,
+in which case the request is unpacked, edited and re-packed (`pack(observation)`). Protocol details:
+the `wallx-api` skill.
+
+## Setup and tests
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r harness/requirements.txt
+(cd harness && ../.venv/bin/python -m unittest -v test_harness.py)   # offline: no robot, no API
+export WALLX_ENDPOINT='<on-site ws://HOST:33677 or wss://maas-api.x2robot.com/v1/vla/wallx>'
+export WALLX_HEADERS_FILE=~/.config/wallx/headers.json
+```
+
+Probe Wall-X first (the `wallx-api` probe, handshake only). The robot must reach port 8001 on the
+laptop: `sudo ufw allow from 192.168.77.0/24 to any port 8001` when ufw is active (the user runs sudo).
 
 ## Run
-Bind to the LAN IP the robot client can reach (this host: `10.19.20.98`; the client may run in a
-container, so don't rely on 127.0.0.1). Run in background and watch for `event=chunk` lines.
 
-1. **Passthrough** (baseline, no agent):
-   `cd harness && ../.venv/bin/python harness.py --host 10.19.20.98 --port 8001 --passthrough`
-2. **With vision agent** (OpenAI-compatible Chat Completions with image_url support):
-   ```bash
-   export AGENT_CHAT_URL=https://.../v1/chat/completions AGENT_MODEL=<vision-model>
-   read -rs AGENT_API_KEY; export AGENT_API_KEY      # user types it; never pass on cmdline
-   ../.venv/bin/python harness.py --host 10.19.20.98 --port 8001 --agent-every 4
-   ```
-   `--agent-every N` = replan every N model requests (not control steps).
-   Agent HTTP timeout 10 s; WALLX send/recv timeout 60 s.
+Bind to `192.168.77.18`, the address the robot reaches. Run the harness in the background and watch
+for `event=chunk` lines (one per round trip).
 
-Then the **user** sets in WebUI → Edit Model Configuration: `model_address = ws://10.19.20.98:8001`,
-`EndPose`, `sync`, same infer_params as direct run. Start a Case from the WebUI.
+```bash
+cd harness && ../.venv/bin/python harness.py --host 192.168.77.18 --port 8001 --passthrough
+```
 
-## Stopping (critical)
-User clicks **End Evaluation Inference Mode** → enters scores → **Submit Scores** → *then* Ctrl+C / stop
-the harness. Closing the harness does NOT stop the arm; the client may reconnect. Never claim an
-agent "stop"/"complete" output halts hardware.
+The user then sets, in the WebUI's Edit Model Configuration, `model_address = ws://192.168.77.18:8001`,
+`EndPose`, `sync`, with the same `infer_params` as the direct run, and starts the Case from the WebUI.
+Stop order: WebUI "End Evaluation Inference Mode" → submit scores → Ctrl+C the harness.
 
-## Extending `VisionAgent.decide()`
-Signature `decide(observation, goal, previous, history) -> str` (non-empty instruction; set `self.reason`).
-Empty/invalid/timeout → harness closes the session (code 1011) and the operator must stop in WebUI.
-Agent sees: goal (task instruction), 3 images (front/left_wrist/right_wrist), state, history (last 8).
-`env_description`/`scores_dict` are NOT passed automatically — load the task JSON yourself if useful.
+## Code map (`harness/harness.py`)
 
-Improvement directions from the guide: sub-goal selection from observations (don't restart task),
-memory (completed stages, failures, retry counts), failure-type recovery with retry limits,
-call scheduling to cut latency, completion detection, structured logs for reproducibility.
-After any harness change, re-run the offline tests and add tests for new behavior.
+- `Harness.handle(downstream)`: per-connection loop. Receives the handshake from upstream and sends it
+  down, then for each request: validate → choose instruction → forward → return the reply.
+- `validate_request`, `instruction_text`: input checks.
+- `VisionAgent.decide(observation, goal, previous, history) -> str`: the optional planner,
+  configured by `AGENT_CHAT_URL` / `AGENT_MODEL` / `AGENT_API_KEY`; enabled when `--passthrough` is
+  dropped. `--agent-every N` replans every N model requests. Agent timeout 10 s; Wall-X timeout 60 s.
+- An empty or invalid instruction, or a timeout, closes the session (1011); the operator stops in the WebUI.
+
+## Extending (plan Phases 4–5)
+
+- **Typed command**: a shared `CommandState` (current, pending, history). Set `request["instruction"]`
+  from it just before forwarding. Non-empty, ≤ 200 chars. The switch policy (next request / after chunk /
+  on Apply) is the user's choice; check `plan.md`.
+- **Timing**: record robot→harness receive, the Wall-X round trip and the reply send per request,
+  and flag the warm-up call. Add the fields to the `event=chunk` log line.
+- **GUI**: `aiohttp` HTTP + WebSocket on `127.0.0.1:8080` in the same process. Push the 3 JPEGs
+  (throttled ~5 fps), both arms' pose and gripper, the active instruction, Wall-X's first frame and
+  the timings; accept `{"type": "command", "text": …}`. A single `gui/static/index.html` with no build
+  step. It carries a permanent banner "Stop = WebUI → End Evaluation Inference Mode"; stopping lives in the WebUI only.
+- The GUI only updates while a Case runs, because the client only sends during inference. Show "last update N s ago".
+- Every change: re-run the offline tests, plus new tests for the change (command override leaves all
+  other fields identical; bad input rejected; a GUI disconnect leaves the relay running).
 
 ## Evaluate
-Same Case, same initial layout, same infer_params for direct vs harness. Record: task file, case_id,
-harness version, agent model + prompt version, success/scores, time, #agent and #VLA calls,
-latency, instructions sent, retries/recovery, failure reason. Keep instructions & timings in logs; no keys.
+
+Same Case, layout and `infer_params` for direct vs harness. Record the task file, case_id, harness
+version, commands sent, success/scores, time, Wall-X calls and latency, and the failure reason. No keys in logs.

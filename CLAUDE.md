@@ -1,24 +1,42 @@
 # X-Square Robot hackathon workspace
 
-This machine **is the robot host** (user `xr`, LAN IP `10.19.20.98`). The robot stack is
-already running: `ros2 launch x2robot_infer infer_with_dispatcher.launch.py`
-(`x2robot_infer_node` + `x2robot_action_dispatcher_cpp`) and `moveit_servo_desktop`.
+Goal: type a command → the **Wall-X** model moves the TeleTwin Desktop arms (dual 6-DOF, G gripper),
+with a browser dashboard for the cameras and arm readings.
 
-Source of truth: `Hackathon Participant Guide.pdf` (extract with `pdftotext -layout`).
+**`plan.md` is the plan and the progress record.** Read it before any robot work. Work phase by phase
+and tick its checkboxes as items are verified.
 
-## Layout
-- `harness/` – organizer demo: `harness.py` (sync WebSocket relay + VisionAgent), `test_harness.py` (offline), `requirements.txt`
-- `tasks/` – task JSON drafts (`local_<task_id>.json`); deployed copies live in `/home/xr/diversity/`
-- `.claude/skills/` – `robot-task`, `robot-harness`, `wallx-api`
-- `.venv/` – Python venv for the harness (not committed)
+## Machines
 
-## Safety rules (hard)
-- **Never start another control process** (`start_desktop.sh`, a second `infer_with_dispatcher`, etc.) while the existing nodes run. Use `--attach` if terminal debugging is required, and only after the user confirms.
-- **Stopping, homing and scoring happen only in the WebUI** (`http://10.19.20.98/`). Killing the harness, closing a WebSocket, or an agent saying "stop"/"done" does NOT stop the arm. Always tell the user to click "End Evaluation Inference Mode" first, then Ctrl+C the harness.
-- Never replay cached actions after a disconnect; rebuild session and fetch fresh observations.
-- Do not send anything that makes the arm move without the user explicitly asking in that turn.
+- **This machine is the laptop**, not the robot: user `francesca`, `192.168.77.18` on Ethernet
+  (`enx…`); Wi-Fi `10.19.19.179` is a different network.
+- **Robot**: `xr@192.168.77.2`. SSH needs a password, so the user runs robot-side commands and pastes
+  results back. WebUI: `http://192.168.77.2/`.
+- The robot's own client drives the motors. Our code runs on the laptop: `harness/harness.py`
+  listens on `192.168.77.18:8001`, the robot connects to it, and it forwards to Wall-X.
+
+## Safety (hard rules)
+
+- **The WebUI is the stop.** Stopping, homing and scoring happen only in the WebUI. Stop order:
+  "End Evaluation Inference Mode" → submit scores → then Ctrl+C the harness. Closing the harness,
+  a socket or the GUI leaves the arm running, so say this whenever a run is started.
+- Motion starts only when the user explicitly asks for it in that turn.
+- On the robot, observe only (`ps`, `ros2 topic list/echo/hz`). Starting, stopping or relaunching
+  control processes needs the user's explicit OK; the guide forbids a second control process.
+- After a disconnect: confirm the stop in the WebUI, reconnect, re-read the handshake, use fresh
+  observations. Old action chunks are discarded.
 
 ## Secrets
-- The WALLX key lives in `/home/xr/diversity/local/state/model_overrides.json` (`async_params.api_key`). Never print it, commit it, or put it in task JSON. Redact when displaying that file.
-- Harness auth: `WALLX_HEADERS_FILE` → JSON `{"Authorization": "Bearer <key>"}`, mode 600, outside the repo (`~/.config/wallx/headers.json`).
-- Agent key (`AGENT_API_KEY`) is separate from the WALLX key.
+
+- The Wall-X key lives only in `~/.config/wallx/headers.json` (`600`), used via `WALLX_HEADERS_FILE`.
+- `docs/API Tutorial & User Guide - 2610 (Condensed Version).pdf` contains the key in plain text.
+  When extracting it, pipe through `sed -E 's/sk-[A-Za-z0-9_-]+/sk-<redacted>/g'`.
+- Keys stay out of task JSON, logs, the GUI, commits and chat. `*.pdf` and `*headers*.json` are git-ignored.
+
+## Layout
+
+- `docs/`: organizer PDFs (extract with `pdftotext -layout`) and the original demo in `participant-guide-demo (1)/`
+- `harness/`: relay; becomes the typed-command + GUI server (plan Phases 3–5)
+- `tasks/`: task JSON drafts `local_<id>.json`; deployed copies go to the robot's `/home/xr/diversity/`
+- `.venv/`: harness venv (`python3 -m venv .venv && .venv/bin/pip install -r harness/requirements.txt`)
+- Skills: `robot-task` (task JSON + deploy), `robot-harness` (relay, typed commands, GUI), `wallx-api` (protocol + probe)
