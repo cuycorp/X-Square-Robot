@@ -1256,6 +1256,13 @@ for (let i = 0; i < 9; i++) {
   cubeLiveMini.append(cell);
 }
 
+const FACE_OVERLAY_COLOR = {
+  U: '#38bdf8',
+  F: '#a855f7',
+  R: '#34d399',
+  L: '#fbbf24'
+};
+
 function drawFeedOverlay(feed) {
   const canvas = feed.overlay;
   const rect = feed.image.getBoundingClientRect();
@@ -1267,10 +1274,16 @@ function drawFeedOverlay(feed) {
   }
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, cw, ch);
-  const live = cubeState && cubeState.live;
-  if (!live || !live.detected || !live.quad || live.source !== feed.topic || feed.image.hidden || !feed.image.naturalWidth) {
+  const det = (cubeState?.live_by_source && cubeState.live_by_source[feed.topic])
+    || (cubeState?.live?.source === feed.topic ? cubeState.live : null);
+  if (!det || !det.detected || feed.image.hidden || !feed.image.naturalWidth) {
     return;
   }
+  const vfaces = (det.visible_faces && det.visible_faces.length)
+    ? det.visible_faces
+    : (det.quad ? [{ face: 'F', quad: det.quad, cell_centers: det.cell_centers, grid: det.grid }] : []);
+  if (!vfaces.length) return;
+
   const natW = feed.image.naturalWidth;
   const natH = feed.image.naturalHeight;
   const scale = Math.min(cw / natW, ch / natH);
@@ -1280,28 +1293,49 @@ function drawFeedOverlay(feed) {
   const offY = (ch - drawH) * 0.5;
   const toPx = ([nx, ny]) => [offX + nx * drawW, offY + ny * drawH];
 
-  const pts = live.quad.map(toPx);
   ctx.save();
-  ctx.strokeStyle = '#38bdf8';
-  ctx.lineWidth = 2.5;
-  ctx.beginPath();
-  ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
-  ctx.closePath();
-  ctx.stroke();
+  for (const vf of vfaces) {
+    if (!vf.quad || vf.quad.length < 4) continue;
+    const pts = vf.quad.map(toPx);
+    const strokeCol = FACE_OVERLAY_COLOR[vf.face] || '#38bdf8';
+    ctx.strokeStyle = strokeCol;
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+    ctx.stroke();
 
-  if (live.cell_centers && live.grid) {
-    for (let r = 0; r < 3; r++) {
-      for (let c = 0; c < 3; c++) {
-        const [px, py] = toPx(live.cell_centers[r][c]);
-        const code = live.grid[r][c] || '?';
-        ctx.beginPath();
-        ctx.arc(px, py, 7, 0, Math.PI * 2);
-        ctx.fillStyle = CUBE_PALETTE[code] || CUBE_PALETTE['?'];
-        ctx.fill();
-        ctx.lineWidth = 1.5;
-        ctx.strokeStyle = '#0f172a';
-        ctx.stroke();
+    if (vf.face) {
+      const lx = pts[0][0];
+      const ly = Math.max(12, pts[0][1] - 4);
+      ctx.fillStyle = strokeCol;
+      ctx.font = '700 10px system-ui, sans-serif';
+      ctx.fillText(vf.face, lx, ly);
+    }
+
+    if (vf.cell_centers && vf.grid) {
+      const dotR = Math.max(3.5, Math.min(6.5, drawW * 0.008));
+      for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 3; c++) {
+          const code = vf.grid[r]?.[c] || '?';
+          const [px, py] = toPx(vf.cell_centers[r][c]);
+          if (code === '?') {
+            ctx.beginPath();
+            ctx.arc(px, py, dotR * 0.75, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(148, 163, 184, 0.55)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            continue;
+          }
+          ctx.beginPath();
+          ctx.arc(px, py, dotR, 0, Math.PI * 2);
+          ctx.fillStyle = CUBE_PALETTE[code] || CUBE_PALETTE['?'];
+          ctx.fill();
+          ctx.lineWidth = 1.3;
+          ctx.strokeStyle = '#0f172a';
+          ctx.stroke();
+        }
       }
     }
   }
@@ -1341,15 +1375,26 @@ function render3DCube() {
   const live = cubeState?.live;
   const faces = cubeState?.faces;
   const targetPreviewFace = cubeTargetFace.value === 'AUTO' ? 'F' : cubeTargetFace.value;
+  const liveFaceMap = {};
+  if (live?.detected) {
+    if (live.visible_faces && live.visible_faces.length >= 2) {
+      for (const vf of live.visible_faces) {
+        if (vf.face && vf.grid) liveFaceMap[vf.face] = vf.grid;
+      }
+    } else if (live.grid) {
+      liveFaceMap[targetPreviewFace] = live.grid;
+    }
+  }
   const polys = [];
 
   for (const [faceKey, basis] of Object.entries(FACE_BASIS)) {
     const nt = xform3D(basis.n);
     if (nt[2] <= 0.02) continue;
     const faceData = faces?.[faceKey];
-    const useLivePreview = Boolean(live?.detected && (!faceData?.scanned || (cubeState?.validation?.scanned_faces === 0 && faceKey === targetPreviewFace)));
-    const grid = (useLivePreview && faceKey === targetPreviewFace)
-      ? live.grid
+    const liveGrid = liveFaceMap[faceKey];
+    const useLivePreview = Boolean(liveGrid && !faceData?.scanned);
+    const grid = useLivePreview
+      ? liveGrid
       : (faceData?.grid || [['?','?','?'],['?','?','?'],['?','?','?']]);
 
     // Dark cube body quad
@@ -1362,7 +1407,7 @@ function render3DCube() {
       return xform3D(p3);
     });
     const bodyDepth = bodyPts.reduce((acc, p) => acc + p[2], 0) / 4;
-    polys.push({ depth: bodyDepth - 0.01, pts: bodyPts, fill: '#141821', stroke: (useLivePreview && faceKey === targetPreviewFace) ? '#38bdf8' : '#2a3242', lineWidth: (useLivePreview && faceKey === targetPreviewFace) ? 2 : 1 });
+    polys.push({ depth: bodyDepth - 0.01, pts: bodyPts, fill: '#141821', stroke: useLivePreview ? (FACE_OVERLAY_COLOR[faceKey] || '#38bdf8') : '#2a3242', lineWidth: useLivePreview ? 2 : 1 });
 
     // 3x3 stickers slightly raised along normal
     for (let r = 0; r < 3; r++) {
@@ -1465,9 +1510,12 @@ function renderCubeUI(state) {
   const srcLabel = feeds.get(live.source)?.label || live.source || '';
   if (live.detected) {
     const pct = Math.round((live.confidence || 0) * 100);
+    const nFaces = live.visible_faces?.length || 1;
+    const nStickers = live.total_known_stickers || 0;
+    const faceSummary = nFaces > 1 ? ` · ${nFaces} faces (${nStickers} tiles)` : '';
     const pos = live.estimated_pose?.position_m;
     const poseTxt = pos ? ` · est (${pos[0].toFixed(2)}, ${pos[1].toFixed(2)}, ${pos[2].toFixed(2)}) m` : '';
-    cubeDetectBadge.textContent = `Detected (${pct}%)${srcLabel ? ' · ' + srcLabel : ''}${poseTxt}`;
+    cubeDetectBadge.textContent = `Detected (${pct}%)${faceSummary}${srcLabel ? ' · ' + srcLabel : ''}${poseTxt}`;
     cubeDetectBadge.className = 'cube-badge ok';
   } else {
     cubeDetectBadge.textContent = srcLabel ? `Scanning ${srcLabel} · no cube yet` : 'No cube detected';
@@ -1575,10 +1623,9 @@ async function stepLiveCubeDetection() {
   if (mode === 'auto') {
     const available = [...feeds.values()].filter(f => Boolean(f.latestB64));
     if (!available.length) return;
-    // Prefer whichever feed currently detects the cube; otherwise cycle round-robin
-    const currentSrc = cubeState?.live?.detected ? cubeState.live.source : '';
-    chosen = available.find(f => f.topic === currentSrc) || available[cubeAutoIndex % available.length];
-    if (!cubeState?.live?.detected) cubeAutoIndex++;
+    // Cycle across all active feeds so every camera view keeps an up-to-date overlay
+    chosen = available[cubeAutoIndex % available.length];
+    cubeAutoIndex++;
   } else {
     const f = feeds.get(mode);
     if (f && f.latestB64) chosen = f;
@@ -1604,7 +1651,8 @@ document.getElementById('cube-capture-btn').addEventListener('click', async () =
   if (res?.captured_face) {
     selectedCubeFace = res.captured_face;
     renderCubeUI(res.state);
-    cubeStatusEl.textContent = `Captured live grid onto face ${res.captured_face}.`;
+    const list = (res.captured_faces && res.captured_faces.length) ? res.captured_faces.join(', ') : res.captured_face;
+    cubeStatusEl.textContent = `Captured live grid onto face(s) ${list}.`;
   }
 });
 

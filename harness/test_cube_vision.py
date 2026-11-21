@@ -301,5 +301,155 @@ class TestCubeStateAndConsoleAPI(unittest.TestCase):
         self.assertEqual(live["grid"], grid)
 
 
+
+def render_isometric_two_face_cube(
+    top_grid: list[list[str]],
+    front_grid: list[list[str]],
+    *,
+    w: int = 640,
+    h: int = 480,
+    occlude_front_bottom: bool = False,
+) -> Image.Image:
+    """Render an isometric 2-face cube on a warm-oak tabletop, optionally occluded by a gripper."""
+    img = Image.new("RGB", (w, h), (186, 146, 76))
+    draw = ImageDraw.Draw(img)
+    # Warm-oak plank lines and subtle color variation
+    for y in range(0, h, 48):
+        tone = 176 if (y // 48) % 2 == 0 else 194
+        draw.rectangle([0, y, w, y + 46], fill=(tone, int(tone * 0.78), int(tone * 0.41)))
+        draw.line([0, y, w, y], fill=(142, 108, 55), width=2)
+
+    # Top face corners (u_vec = (+78, +32), v_vec = (-54, +66))
+    p00 = (280.0, 140.0)
+    u_vec = (78.0, 32.0)
+    v_vec = (-54.0, 66.0)
+    w_vec = (0.0, 82.0)
+
+    def pt_top(u: float, v: float) -> tuple[float, float]:
+        return (p00[0] + u * u_vec[0] + v * v_vec[0], p00[1] + u * u_vec[1] + v * v_vec[1])
+
+    def pt_front(u: float, t: float) -> tuple[float, float]:
+        base = pt_top(u, 1.0)
+        return (base[0] + t * w_vec[0], base[1] + t * w_vec[1])
+
+    # Black plastic backing for top (U) and front (F)
+    draw.polygon([pt_top(-0.04, -0.04), pt_top(1.04, -0.04), pt_top(1.04, 1.04), pt_top(-0.04, 1.04)], fill=(20, 20, 22))
+    draw.polygon([pt_front(-0.04, 0.0), pt_front(1.04, 0.0), pt_front(1.04, 1.04), pt_front(-0.04, 1.04)], fill=(20, 20, 22))
+
+    gap = 0.04
+    for r in range(3):
+        for c in range(3):
+            u0, u1 = c / 3.0 + gap, (c + 1) / 3.0 - gap
+            v0, v1 = r / 3.0 + gap, (r + 1) / 3.0 - gap
+            draw.polygon([pt_top(u0, v0), pt_top(u1, v0), pt_top(u1, v1), pt_top(u0, v1)], fill=PALETTE[top_grid[r][c]])
+            draw.polygon([pt_front(u0, v0), pt_front(u1, v0), pt_front(u1, v1), pt_front(u0, v1)], fill=PALETTE[front_grid[r][c]])
+
+    if occlude_front_bottom:
+        # Border-touching white+dark gripper shell occluding lower portion of F
+        draw.polygon([(110, 480), (210, 258), (370, 258), (490, 480)], fill=(238, 240, 242))
+        draw.polygon([(155, 480), (235, 276), (345, 276), (435, 480)], fill=(24, 24, 26))
+    return img
+
+
+class TestCubeRegressionRealStation(unittest.TestCase):
+    def test_warm_lighting_red_orange_yellow_and_rubber_rejection(self) -> None:
+        # Calibrated station RGB samples: Red H~2 deg, Orange H~31 deg, Yellow H~52 deg, rubber glare H~30 deg low V
+        samples = [
+            ((141, 42, 39), "R"),
+            ((208, 135, 69), "O"),
+            ((190, 173, 47), "Y"),
+            ((28, 38, 70), "B"),
+            ((27, 74, 23), "G"),
+        ]
+        for rgb, expected in samples:
+            got, conf = classify_rgb_sticker(rgb)
+            self.assertEqual(got, expected, f"RGB {rgb} expected {expected}, got {got} (conf={conf})")
+
+        # Dark brown rubber specular glare must be rejected as unknown '?'
+        got_glare, _ = classify_rgb_sticker((78, 56, 40))
+        self.assertEqual(got_glare, "?")
+
+    def test_warm_oak_tabletop_and_clutter_rejected(self) -> None:
+        img = Image.new("RGB", (640, 480), (188, 148, 78))
+        draw = ImageDraw.Draw(img)
+        for y in range(0, 480, 48):
+            tone = 174 if (y // 48) % 2 == 0 else 196
+            draw.rectangle([0, y, 640, y + 46], fill=(tone, int(tone * 0.78), int(tone * 0.42)))
+        # Wires + notebook + bottle-like clutter, no cube
+        draw.line([(20, 40), (240, 180), (110, 320)], fill=(235, 235, 232), width=5)
+        draw.rectangle([380, 60, 520, 130], fill=(35, 65, 48))
+        for use_cv2 in (True, False):
+            res = detect_cube_cv(img, source="front", use_cv2=use_cv2)
+            self.assertFalse(res["detected"], f"False positive on wood tabletop with use_cv2={use_cv2}")
+
+    def test_isometric_two_face_and_gripper_occlusion_both_backends(self) -> None:
+        top_grid = [["O", "O", "B"], ["O", "O", "Y"], ["O", "R", "O"]]
+        front_grid = [["B", "G", "Y"], ["B", "B", "B"], ["B", "B", "Y"]]
+        img_clear = render_isometric_two_face_cube(top_grid, front_grid, occlude_front_bottom=False)
+        img_occ = render_isometric_two_face_cube(top_grid, front_grid, occlude_front_bottom=True)
+
+        for use_cv2 in (True, False):
+            res = detect_cube_cv(img_clear, source="front", use_cv2=use_cv2)
+            self.assertTrue(res["detected"])
+            faces = {vf["face"]: vf["grid"] for vf in res.get("visible_faces", [])}
+            self.assertIn("U", faces)
+            self.assertIn("F", faces)
+            self.assertEqual(faces["U"], top_grid)
+            self.assertEqual(faces["F"], front_grid)
+            self.assertEqual(res["total_known_stickers"], 18)
+
+            res_occ = detect_cube_cv(img_occ, source="cam1", use_cv2=use_cv2)
+            self.assertTrue(res_occ["detected"])
+            faces_occ = {vf["face"]: vf["grid"] for vf in res_occ.get("visible_faces", [])}
+            self.assertEqual(faces_occ["U"], top_grid)
+            self.assertIn("F", faces_occ)
+            # Bottom row of F is behind the white+dark gripper and must be occluded ('?'), never 'W'
+            self.assertEqual(faces_occ["F"][2], ["?", "?", "?"])
+
+    def test_multicam_live_by_source_anti_flicker_and_auto_capture(self) -> None:
+        top_grid = [["O", "O", "B"], ["O", "O", "Y"], ["O", "R", "O"]]
+        front_grid = [["B", "G", "Y"], ["B", "B", "B"], ["B", "B", "Y"]]
+        img_b64 = img_to_b64(render_isometric_two_face_cube(top_grid, front_grid, occlude_front_bottom=False))
+
+        ctrl = PromptController("Scan cube")
+        srv = start_console_http_server("127.0.0.1", 0, ctrl)
+        origin = f"http://127.0.0.1:{srv.server_port}"
+
+        def call(path: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+            req = urllib.request.Request(
+                origin + path,
+                data=(json.dumps(data).encode("utf-8") if data is not None else None),
+                headers={"Content-Type": "application/json"} if data is not None else {},
+                method="POST" if data is not None else "GET",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return json.load(resp)
+
+        try:
+            snap = call("/api/cube/detect", {"image_b64": img_b64, "source": "front"})
+            self.assertTrue(snap["live"]["detected"])
+            self.assertEqual(len(snap["live"]["visible_faces"]), 2)
+            self.assertIn("front", snap["live_by_source"])
+
+            # Empty frame from a DIFFERENT camera clears cam1's own overlay without wiping front's active live detection
+            blank_b64 = img_to_b64(Image.new("RGB", (640, 480), (185, 145, 76)))
+            snap2 = call("/api/cube/detect", {"image_b64": blank_b64, "source": "cam1"})
+            self.assertFalse(snap2["live_by_source"]["cam1"]["detected"])
+            self.assertTrue(snap2["live"]["detected"])
+            self.assertEqual(snap2["live"]["source"], "front")
+
+            # Auto-capture stores both visible faces U and F
+            cap = call("/api/cube/capture", {"face": "AUTO"})
+            self.assertEqual(cap["captured_faces"], ["U", "F"])
+            self.assertEqual(cap["state"]["faces"]["U"]["grid"], top_grid)
+            self.assertEqual(cap["state"]["faces"]["F"]["grid"], front_grid)
+
+            # Same camera losing the cube immediately clears live detection
+            snap3 = call("/api/cube/detect", {"image_b64": blank_b64, "source": "front"})
+            self.assertFalse(snap3["live"]["detected"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 if __name__ == "__main__":
     unittest.main()

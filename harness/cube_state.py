@@ -67,8 +67,11 @@ class CubeStateManager:
             "grid": empty_grid(),
             "cell_rgb": None,
             "estimated_pose": None,
+            "visible_faces": [],
+            "total_known_stickers": 0,
             "updated_at": None,
         }
+        self._live_by_source: dict[str, dict[str, Any]] = {}
         self._reset_faces_locked()
 
     def _reset_faces_locked(self) -> None:
@@ -88,19 +91,36 @@ class CubeStateManager:
             self._reset_faces_locked()
 
     def update_live(self, detection: dict[str, Any], source: str = "") -> None:
+        src = source or str(detection.get("source", ""))
+        entry = {
+            "detected": bool(detection.get("detected", False)),
+            "confidence": round(float(detection.get("confidence", 0.0)), 3),
+            "source": src,
+            "bbox": detection.get("bbox"),
+            "quad": detection.get("quad"),
+            "cell_centers": detection.get("cell_centers"),
+            "grid": detection.get("grid") or empty_grid(),
+            "cell_rgb": detection.get("cell_rgb"),
+            "estimated_pose": detection.get("estimated_pose"),
+            "visible_faces": copy.deepcopy(detection.get("visible_faces") or []),
+            "total_known_stickers": int(detection.get("total_known_stickers", 0)),
+            "updated_at": time.time(),
+        }
         with self._lock:
-            self._live = {
-                "detected": bool(detection.get("detected", False)),
-                "confidence": round(float(detection.get("confidence", 0.0)), 3),
-                "source": source or str(detection.get("source", "")),
-                "bbox": detection.get("bbox"),
-                "quad": detection.get("quad"),
-                "cell_centers": detection.get("cell_centers"),
-                "grid": detection.get("grid") or empty_grid(),
-                "cell_rgb": detection.get("cell_rgb"),
-                "estimated_pose": detection.get("estimated_pose"),
-                "updated_at": time.time(),
-            }
+            if src:
+                self._live_by_source[src] = copy.deepcopy(entry)
+            now = float(entry["updated_at"] or 0.0)
+            cur = self._live
+            keep_active_other = (
+                not entry["detected"]
+                and bool(cur.get("detected"))
+                and bool(src)
+                and bool(cur.get("source"))
+                and src != cur.get("source")
+                and (now - float(cur.get("updated_at") or 0.0)) < 4.0
+            )
+            if not keep_active_other:
+                self._live = entry
 
     def capture_face(
         self,
@@ -110,18 +130,47 @@ class CubeStateManager:
         confidence: float | None = None,
     ) -> dict[str, Any]:
         with self._lock:
+            is_auto = face is None or str(face).strip().upper() == "AUTO"
             if grid is None:
                 if not self._live.get("detected"):
                     raise ValueError("No Rubik's cube face currently detected in live view")
-                norm_grid = normalize_grid(self._live["grid"])
                 used_source = source or str(self._live.get("source", "live"))
+                visible_faces = self._live.get("visible_faces") or []
+                if is_auto and len(visible_faces) >= 2:
+                    captured_faces: list[str] = []
+                    for vf in visible_faces:
+                        vf_grid = normalize_grid(vf.get("grid"))
+                        known = sum(1 for r in vf_grid for c in r if c != UNKNOWN)
+                        if known < 4:
+                            continue
+                        role = str(vf.get("face", "")).strip().upper()
+                        target = self._pick_face_by_center_locked(vf_grid[1][1], preferred=role if role in FACES else None)
+                        existing_known = sum(1 for r in self._faces[target]["grid"] for c in r if c != UNKNOWN)
+                        if self._faces[target]["scanned"] and existing_known > known:
+                            continue
+                        vf_conf = float(vf.get("confidence", self._live.get("confidence", 0.0))) if confidence is None else float(confidence)
+                        self._faces[target] = {
+                            "grid": vf_grid,
+                            "scanned": True,
+                            "source": used_source,
+                            "confidence": round(vf_conf, 3),
+                            "updated_at": time.time(),
+                        }
+                        captured_faces.append(target)
+                    if captured_faces:
+                        return {
+                            "captured_face": captured_faces[0],
+                            "captured_faces": captured_faces,
+                            "state": self._snapshot_locked(),
+                        }
+                norm_grid = normalize_grid(self._live["grid"])
                 used_conf = float(self._live.get("confidence", 0.0)) if confidence is None else float(confidence)
             else:
                 norm_grid = normalize_grid(grid)
                 used_source = source or "manual"
                 used_conf = 1.0 if confidence is None else float(confidence)
 
-            if face is None or str(face).strip().upper() == "AUTO":
+            if is_auto:
                 target_face = self._pick_face_by_center_locked(norm_grid[1][1])
             else:
                 target_face = str(face).strip().upper()
@@ -137,19 +186,22 @@ class CubeStateManager:
             }
             return {
                 "captured_face": target_face,
+                "captured_faces": [target_face],
                 "state": self._snapshot_locked(),
             }
 
-    def _pick_face_by_center_locked(self, center_color: str) -> str:
+    def _pick_face_by_center_locked(self, center_color: str, preferred: str | None = None) -> str:
         if center_color in VALID_COLORS:
             for face in AUTO_FACE_ORDER:
                 entry = self._faces[face]
                 if entry["scanned"] and entry["grid"][1][1] == center_color:
                     return face
+        if preferred and preferred in FACES and not self._faces[preferred]["scanned"]:
+            return preferred
         for face in AUTO_FACE_ORDER:
             if not self._faces[face]["scanned"]:
                 return face
-        return "F"
+        return preferred if preferred in FACES else "F"
 
     def rotate_face(self, face: str, turns_cw: int = 1) -> dict[str, Any]:
         target = str(face).strip().upper()
@@ -245,6 +297,7 @@ class CubeStateManager:
     def _snapshot_locked(self) -> dict[str, Any]:
         return {
             "live": copy.deepcopy(self._live),
+            "live_by_source": copy.deepcopy(self._live_by_source),
             "faces": copy.deepcopy(self._faces),
             "validation": self._validation_locked(),
         }
