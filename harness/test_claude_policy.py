@@ -433,5 +433,26 @@ class TestWebSocketLoopback(unittest.TestCase):
                 t.join(timeout=3)
 
 
+class TestStopReasonDiagnostics(unittest.TestCase):
+    def test_stop_reason_refusal_and_max_tokens_diagnostics(self) -> None:
+        req = validate_request(build_observation_payload(TabletopState(), "Grasp the cube"))
+        planner = ClaudeEndPosePlanner(api_key="test-key", model="claude-sonnet-5-5", plan_every=1)
+        self.assertGreaterEqual(planner.build_request_body(req)["max_tokens"], 2048)
+
+        with patch.object(planner, "_post_messages", return_value={
+            "stop_reason": "refusal",
+            "content": [{"type": "text", "text": "Cannot command arm near person"}],
+        }):
+            with self.assertRaisesRegex(RuntimeError, "stop_reason=refusal.*Cannot command arm"):
+                planner.decide(req)
+
+        with patch.object(planner, "_post_messages", return_value={
+            "stop_reason": "max_tokens",
+            "content": [{"type": "text", "text": '{"stage": "approach", "status":'}],
+        }):
+            with self.assertRaisesRegex(RuntimeError, "stop_reason=max_tokens"):
+                planner.decide(req)
+
+
 if __name__ == "__main__":
     unittest.main()

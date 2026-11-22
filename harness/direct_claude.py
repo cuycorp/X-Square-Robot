@@ -36,7 +36,8 @@ CUBE_DEPTH_CONTEXT = (
     "local_perception.cube_depth reports cube_top_center_m (the cube's top face, not a gripper target) and nearby table_z_m in base_link. "
     "Use its x/y for alignment and table_z_m to maintain vertical clearance. "
     "If last_seen is present while the moving arm briefly blocks the front view, rely on last_seen for the stationary tabletop cube and align visually with left_wrist. "
-    "Return retry if the target, approach, or tabletop clearance is uncertain. "
+    "If cube_depth reports status='unavailable' and last_seen is null (for example when an arm blocks the front view) while left_wrist clearly sees the cube, do not abort: align visually with left_wrist and front RGB in short 2 to 4 cm increments. "
+    "Return retry only if the target is held, missing from all views, or unsafe. "
 )
 RGB_ONLY_CONTEXT = (
     "RGB-only mode (no depth measurement is attached): do not wait for cube_depth or table_z_m. "
@@ -200,7 +201,7 @@ class DirectClaudeControl:
         try:
             planner = ClaudeEndPosePlanner(
                 api_key=self.key_planner.api_key, base_url=self.key_planner.base_url,
-                model=self.key_planner.model, timeout_s=14, plan_every=2,
+                model=self.key_planner.model, timeout_s=18, plan_every=2,
             )
             for index in range(1, 101):
                 if stop.is_set():
@@ -216,11 +217,14 @@ class DirectClaudeControl:
                 front_mount = self.front_mount if measure_now else None
                 images, measured = read_camera_snapshot(self.rosbridge, stop, front_mount, static_cache)
                 sampled_at = started
-                if index == 1 and front_mount is not None and measured["status"] != "measured":
+                if (
+                    index == 1
+                    and front_mount is not None
+                    and measured["status"] != "measured"
+                    and str(measured.get("reason", "")).startswith(("Missing fixed transform", "No synchronized"))
+                ):
                     sampled_at = time.monotonic()
                     images, measured = read_camera_snapshot(self.rosbridge, stop, front_mount, static_cache)
-                    if measured["status"] != "measured":
-                        raise RuntimeError("Cube depth unavailable. " + measured["reason"])
                 if stop.is_set():
                     break
                 states = self.jogger.observe_direct(stop)
@@ -275,7 +279,7 @@ class DirectClaudeControl:
                     break
                 action = "hold"
                 if decision.status not in ("completed", "retry"):
-                    expiry = min(deadline, sampled_at + 25, self._operator_expires_at)
+                    expiry = min(deadline, sampled_at + 35, self._operator_expires_at)
                     if callable(getattr(type(self.jogger), "apply_direct_sequence", None)):
                         action = self.jogger.apply_direct_sequence(observation, decisions, origin, stop, expiry)
                     else:

@@ -30,7 +30,7 @@ SYSTEM_PROMPT = """You autonomously control a bimanual desktop robot (quanta_x1_
 Coordinate frame & camera layout:
 - Robot base frame in meters and radians: +X is forward away from the robot torso, +Y is robot's left, +Z is up.
 - Rotation is RPY [roll, pitch, yaw] with R = Rz(yaw) @ Ry(pitch) @ Rx(roll).
-- CAMERA ORIENTATION WARNING: In the 'front' image, the robot's RIGHT arm appears on the LEFT side of the image, and the robot's LEFT arm appears on the RIGHT side of the image.
+- Coordinate verification: Verify arm correspondence using left_ee / right_ee (+Y is robot's left) together with front, left_wrist, and right_wrist camera views.
 - 'left_wrist' and 'right_wrist' are eye-in-hand cameras mounted on each respective gripper.
 - Gripper range: 0.0 is fully closed, max is 1.526 (gripper-g) or 5.5 (gripper-h). Typical open is ~0.85 * max, typical grasp close is ~0.05 * max.
 
@@ -39,10 +39,10 @@ Control guidelines:
    approach_above -> align_xy -> descend -> grasp (hold position while closing gripper) -> lift -> transport -> place -> release (hold position while opening gripper) -> retreat -> completed.
 2. Return one to four sequential waypoints for the current stage. Use absolute base-frame positions in meters and RPY in radians. Keep each leg short (roughly <= 0.08 m and <= 0.40 rad), clear of the tabletop, both arms and visible obstacles. Give each arm's full pose and gripper when commanding it. Omit any idle arm.
 3. Use feedback from all three cameras and the measured end-effector poses. Stop the current plan at a point where new visual evidence is required, for example before closing on an unverified target or after lifting.
-4. If the scene is ambiguous, the path cannot be estimated from the views, or a grasp is uncertain, return status="retry" and an empty waypoints array. Explain what blocked planning.
+4. If a person's hand or body is inside the robot's reach, or if the path is unsafe or target unseen in all views, return status="retry" in JSON with an empty waypoints array explaining the reason. Ignore distant bystanders seated outside the arms' reach.
 5. Return status="completed" with an empty waypoints array only when fresh observations show the task goal is satisfied. The controller will hold the measured pose.
 
-Respond strictly with ONE valid JSON object (no markdown fences or commentary):
+Respond strictly with ONE valid JSON object (no markdown fences or commentary, keep reason under 25 words):
 {
   "stage": "short_stage_label",
   "status": "in_progress | completed | retry",
@@ -366,7 +366,7 @@ class ClaudeEndPosePlanner:
         ]
         return {
             "model": self.model,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
             "system": SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": content}],
         }
@@ -442,11 +442,26 @@ class ClaudeEndPosePlanner:
             raise AuthError("ANTHROPIC_API_KEY is not set.")
 
         body = self._post_messages(self.build_request_body(req))
-        if body.get("stop_reason") in {"refusal", "max_tokens"}:
-            raise RuntimeError("Claude did not return a complete plan")
-
+        stop_reason = body.get("stop_reason")
         text_parts = [blk.get("text", "") for blk in body.get("content", []) if blk.get("type") == "text"]
-        parsed = extract_json_object("\n".join(text_parts))
+        raw_text = "\n".join(text_parts).strip()
+        if stop_reason == "refusal":
+            snippet = raw_text[:220] or "No explanation returned by the model."
+            raise RuntimeError(f"Claude refused to plan (stop_reason=refusal, model={self.model}): {snippet}")
+        if stop_reason == "max_tokens":
+            try:
+                parsed = extract_json_object(raw_text)
+            except Exception as exc:
+                snippet = raw_text[:220] or "(empty output)"
+                raise RuntimeError(
+                    f"Claude did not return a complete plan (stop_reason=max_tokens, model={self.model}): {snippet}"
+                ) from exc
+        else:
+            try:
+                parsed = extract_json_object(raw_text)
+            except Exception as exc:
+                snippet = raw_text[:220] or f"stop_reason={stop_reason!r}"
+                raise RuntimeError(f"Claude returned invalid plan JSON ({self.model}): {snippet}") from exc
         status = parsed.get("status", "in_progress")
         if status in ("completed", "retry"):
             decision = hold_pose_decision(

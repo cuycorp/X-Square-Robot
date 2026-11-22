@@ -407,3 +407,64 @@ class TestKinematicsPreview(unittest.TestCase):
         finally:
             jogger.finish_direct(stop)
 
+    def test_direct_claude_falls_back_when_front_depth_occluded(self) -> None:
+        robot = Mock()
+        robot.robot_control.get_manipulator_control_mode.return_value.mode = 1
+        seed = {**self.joints, "left_arm_joint2": 0.35, "left_arm_joint3": -0.60}
+        left_positions = list(seed.values())
+        ticks = iter(range(1, 200))
+
+        def feedback(arm):
+            return SimpleNamespace(
+                header=SimpleNamespace(stamp=SimpleNamespace(sec=1, nanosec=next(ticks))),
+                name=[name.replace("left", arm) for name in seed],
+                position=left_positions.copy() if arm == "left" else list(seed.values()),
+                velocity=[0] * 6,
+            )
+
+        robot.left_arm.get_joint_states.side_effect = lambda **_: feedback("left")
+        robot.right_arm.get_joint_states.side_effect = lambda **_: feedback("right")
+        for gripper in (robot.left_gripper, robot.right_gripper):
+            gripper.get_position.return_value.position = 1.2
+        robot.left_arm.set_joint_positions.side_effect = lambda cmd, **_: (
+            left_positions.__setitem__(slice(None), cmd.positions),
+            SimpleNamespace(is_success=True),
+        )[1]
+
+        jogger = DesktopJogger(robot, 1, SimpleNamespace, self.urdf, SimpleNamespace)
+        images = build_observation_payload(TabletopState(), "hold")["observation"]["images"]
+        key_planner = ClaudeEndPosePlanner(api_key="test-key")
+        status = PromptController()
+        finished = threading.Event()
+        orig_finish = status.finish_direct
+        status.finish_direct = lambda *a: (orig_finish(*a), finished.set())
+        seen_perception = []
+
+        planner = Mock()
+        planner.plan_every = 2
+
+        def decide(obs):
+            seen_perception.append(obs.perception)
+            if len(seen_perception) == 1:
+                d = hold_pose_decision(obs, stage="align_xy", status="in_progress")
+                d.left_target_pos[2] -= 0.02
+                return d
+            return hold_pose_decision(obs, stage="done", status="completed")
+
+        planner.decide.side_effect = decide
+        control = DirectClaudeControl(jogger, key_planner, status, "ws://127.0.0.1:1/", front_mount=np.eye(4))
+        with (
+            patch("direct_claude.ClaudeEndPosePlanner", return_value=planner),
+            patch(
+                "direct_claude.read_camera_snapshot",
+                return_value=(images, {"status": "unavailable", "reason": "Could not verify the cube's top and side in the front view."}),
+            ),
+        ):
+            control.start("Grasp the cube with the left gripper", use_cube_depth=True)
+            self.assertTrue(finished.wait(5))
+        snap = status.snapshot()
+        self.assertEqual(snap["status"], "completed")
+        self.assertEqual(seen_perception[0]["cube_depth"]["current_measurement"]["status"], "unavailable")
+        self.assertIn("do not abort", planner.decide.call_args.args[0].instruction)
+        robot.left_arm.set_joint_positions.assert_called()
+
