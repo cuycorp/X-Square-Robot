@@ -352,6 +352,12 @@ class TestClaudePlannerAndHarness(unittest.TestCase):
         srv = start_console_http_server("127.0.0.1", 0, ctrl)
         port = srv.server_address[1]
         try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as page_resp:
+                html_text = page_resp.read().decode("utf-8")
+                self.assertIn('id="code-version"', html_text)
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=3) as status_resp:
+                status_body = json.loads(status_resp.read().decode("utf-8"))
+                self.assertRegex(status_body["code_version"], r"^v\d+")
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/api/prompt",
                 data=json.dumps({"prompt": "Stack red block on blue block"}).encode("utf-8"),

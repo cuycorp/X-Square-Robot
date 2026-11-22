@@ -9,6 +9,7 @@ import html
 import http.server
 import json
 import logging
+import subprocess
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -44,6 +45,25 @@ from trajectory import WorkspaceLimits, synthesize_arm_chunk
 
 LOGGER = logging.getLogger("claude_policy_server")
 MAX_FRAME_BYTES = 64 * 1024 * 1024
+FALLBACK_CODE_VERSION = "v9"
+
+
+def _code_version_label() -> str:
+    repo_dir = Path(__file__).resolve().parent.parent
+    try:
+        count = subprocess.check_output(
+            ["git", "-C", str(repo_dir), "rev-list", "--count", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True, timeout=2,
+        ).strip()
+        sha = subprocess.check_output(
+            ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True, timeout=2,
+        ).strip()
+        if count.isdigit() and sha:
+            return f"v{count} ({sha})"
+    except Exception:
+        pass
+    return FALLBACK_CODE_VERSION
 
 
 def unpack_frame(frame: bytes) -> Any:
@@ -495,7 +515,10 @@ CONSOLE_HTML = r"""<!doctype html>
 <body>
 <div class="wrap">
   <header class="header">
-    <h1>Quanta X1 Pro Console</h1>
+    <div style="display:flex;align-items:center;gap:8px">
+      <h1>Quanta X1 Pro Console</h1>
+      <span id="code-version" class="cube-badge" title="Loaded server code version">v0</span>
+    </div>
     <p class="hint" id="camera-status" role="status">Telemetry disconnected</p>
   </header>
   <section class="card" aria-labelledby="live-camera-title">
@@ -1249,6 +1272,7 @@ async function poll() {
   try {
     const r = await fetch('/api/status');
     const d = await r.json();
+    if (d.code_version) document.getElementById('code-version').textContent = d.code_version;
     policyConnected = d.connected;
     if (typeof d.key_ready === 'boolean' && keyReady !== d.key_ready) {
       keyReady = d.key_ready;
@@ -1878,7 +1902,11 @@ def start_console_http_server(
 ) -> http.server.ThreadingHTTPServer:
     if any(item is not None for item in (live_jog, live_action, release_manual, key_planner, direct_control)) and host != "127.0.0.1":
         raise ValueError("Live SDK controls and cloud key entry require a localhost-only console")
-    page = CONSOLE_HTML
+    version_label = _code_version_label()
+    page = CONSOLE_HTML.replace(
+        '<span id="code-version" class="cube-badge" title="Loaded server code version">v0</span>',
+        f'<span id="code-version" class="cube-badge" title="Loaded server code version">{html.escape(version_label)}</span>',
+    )
     if live_jog is not None:
         page = page.replace(
             'data-live="false">Preview only. Connect to rosbridge for measured joint angles.',
@@ -1942,6 +1970,7 @@ def start_console_http_server(
         def do_GET(self) -> None:
             if self.path == "/api/status":
                 data = prompt_ctrl.snapshot()
+                data["code_version"] = version_label
                 if key_planner is not None:
                     data["key_ready"] = bool(key_planner.api_key)
                 body = json.dumps(data).encode("utf-8")
