@@ -27,7 +27,8 @@ OPERATOR_TIMEOUT = 6.0
 BASE_TASK_CONTEXT = (
     "Use only the left arm and omit right_ee from every waypoint. "
     "Reported poses are gripper-base poses in the robot base_link frame. "
-    "Each control cycle smoothly executes up to 30 mm translation and 12 deg rotation toward your active waypoint (or completes a gripper move). "
+    "Sequential waypoints in your waypoints list (up to 4, up to 50 mm and 20 deg per waypoint) execute continuously in one unbroken trajectory (arm sweeps, gripper change, lift) before fresh camera frames are read. "
+    "Chain consecutive waypoints such as [approach_above, descend] or [descend, grasp, lift] when the path is clear, and end the list wherever fresh visual verification is needed. "
     "Use last_sdk_step and since_last_plan measured displacement feedback together with the updated cameras to verify arm motion. "
     "Keep approach and gripper changes in separate waypoints. "
 )
@@ -257,7 +258,11 @@ class DirectClaudeControl:
                 observation.perception = context or None
                 if origin is None:
                     origin = list(observation.left_ee.position)
-                decision = planner.decide(observation)
+                if callable(getattr(type(planner), "decide_sequence", None)):
+                    decisions = planner.decide_sequence(observation)
+                else:
+                    decisions = [planner.decide(observation)]
+                decision = decisions[-1]
                 history = getattr(planner, "history", None)
                 history_len = len(history) if isinstance(history, list) else 0
                 if history_len > last_plan_count or last_plan_left is None:
@@ -270,8 +275,11 @@ class DirectClaudeControl:
                     break
                 action = "hold"
                 if decision.status not in ("completed", "retry"):
-                    expiry = min(deadline, sampled_at + 20, self._operator_expires_at)
-                    action = self.jogger.apply_direct(observation, decision, origin, stop, expiry)
+                    expiry = min(deadline, sampled_at + 25, self._operator_expires_at)
+                    if callable(getattr(type(self.jogger), "apply_direct_sequence", None)):
+                        action = self.jogger.apply_direct_sequence(observation, decisions, origin, stop, expiry)
+                    else:
+                        action = self.jogger.apply_direct(observation, decision, origin, stop, expiry)
                 self.status.record_step(
                     chunk_index=index, instruction=task, decision=decision,
                     left_ee=asdict(observation.left_ee), right_ee=asdict(observation.right_ee),

@@ -20,12 +20,23 @@ from direct_claude import DirectClaudeControl
 from kinematics import arm_chain, jog_target, measured_pose, pose_target
 from protocol import ArmState, ValidatedRequest
 from server import PromptController, start_console_http_server
-from trajectory import WorkspaceLimits, _min_jerk, clamp_pose, matrix_to_rpy, rotation_distance
+from trajectory import (
+    WorkspaceLimits,
+    _min_jerk,
+    _so3_exp,
+    _so3_log,
+    clamp_pose,
+    matrix_to_rpy,
+    rotation_distance,
+    rpy_to_matrix,
+)
 
 
-DIRECT_MAX_STEP_POS_M = 0.03
-DIRECT_MAX_STEP_ROT_RAD = math.radians(12)
+DIRECT_MAX_STEP_POS_M = 0.05
+DIRECT_MAX_STEP_ROT_RAD = math.radians(20)
 DIRECT_MAX_TRAVEL_RADIUS_M = 0.35
+DIRECT_KNOT_STEP_POS_M = 0.01
+DIRECT_KNOT_STEP_ROT_RAD = math.radians(5)
 DIRECT_SUBSTEP_MAX_JOINT_RAD = math.radians(0.6)
 DIRECT_INTERP_PERIOD_S = 0.022
 DIRECT_SETTLE_TIMEOUT_S = 0.6
@@ -146,10 +157,67 @@ class DesktopJogger:
             if time.monotonic() >= deadline or stop.wait(0.04):
                 return
 
-    def apply_direct(
-        self, observation: ValidatedRequest, decision: PlannerDecision,
+    def _stream_joint_knots(
+        self,
+        controller: Any,
+        q_knots: list[np.ndarray],
+        stop: threading.Event,
+        expires_at: float,
+    ) -> None:
+        arc_s = [0.0]
+        for prev_q, next_q in zip(q_knots, q_knots[1:]):
+            seg_len = float(np.max(np.abs(next_q - prev_q)))
+            arc_s.append(arc_s[-1] + seg_len)
+        total_s = arc_s[-1]
+        if total_s <= 1e-6:
+            return
+        substeps = max(1, math.ceil(1.9 * total_s / DIRECT_SUBSTEP_MAX_JOINT_RAD))
+        seg_idx = 0
+        for step_idx in range(1, substeps + 1):
+            if stop.is_set() or time.monotonic() >= expires_at:
+                raise RuntimeError("The run stopped or the observation expired before dispatch.")
+            s_target = _min_jerk(step_idx / substeps) * total_s
+            while seg_idx + 1 < len(arc_s) - 1 and arc_s[seg_idx + 1] < s_target:
+                seg_idx += 1
+            s0, s1 = arc_s[seg_idx], arc_s[seg_idx + 1]
+            alpha = (s_target - s0) / (s1 - s0) if (s1 - s0) > 1e-9 else 1.0
+            q_cmd = q_knots[seg_idx] + alpha * (q_knots[seg_idx + 1] - q_knots[seg_idx])
+            self._busy_until = time.monotonic() + 0.25
+            result = controller.set_joint_positions(self.command_type(positions=q_cmd.tolist()), timeout=1)
+            if not result.is_success:
+                raise RuntimeError(f"SDK rejected the jog: {result.error_message}")
+            if step_idx < substeps and stop.wait(DIRECT_INTERP_PERIOD_S):
+                raise RuntimeError("Direct Claude control stopped.")
+
+    def _send_gripper_smooth(
+        self,
+        current_opening: float,
+        target_opening: float,
+        stop: threading.Event,
+        expires_at: float,
+    ) -> None:
+        delta_g = target_opening - current_opening
+        g_steps = max(1, math.ceil(abs(delta_g) / 0.35))
+        for g_idx in range(1, g_steps + 1):
+            if stop.is_set() or time.monotonic() >= expires_at:
+                raise RuntimeError("The run stopped or the observation expired before dispatch.")
+            g_cmd = current_opening + _min_jerk(g_idx / g_steps) * delta_g
+            self._busy_until = time.monotonic() + 0.35
+            result = self.robot.left_gripper.set_position(
+                self.gripper_type(position=float(g_cmd)), timeout=2
+            )
+            if not result.is_success:
+                raise RuntimeError(f"SDK rejected the gripper target: {result.error_message}")
+            if g_idx < g_steps and stop.wait(0.05):
+                raise RuntimeError("Direct Claude control stopped.")
+        stop.wait(0.18)
+
+    def apply_direct_sequence(
+        self, observation: ValidatedRequest, decisions: list[PlannerDecision],
         start_position: list[float], stop: threading.Event, expires_at: float,
     ) -> str:
+        if not decisions:
+            return "hold"
         with self._stationary_arm("left", direct_stop=stop) as (controller, current):
             actual = ArmState(**self._measured_arm("left", current))
             planned_from = observation.left_ee
@@ -159,68 +227,94 @@ class DesktopJogger:
                 or abs(actual.gripper - planned_from.gripper) > 0.05
             ):
                 raise RuntimeError("The left arm moved while Claude was planning. Start a fresh run.")
-            if (
-                math.dist(observation.right_ee.position, decision.right_target_pos) > 0.001
-                or rotation_distance(observation.right_ee.rotation_rpy, decision.right_target_rpy) > 0.01
-                or abs(observation.right_ee.gripper - decision.right_gripper) > 0.02
-            ):
-                raise RuntimeError("Claude requested right-arm movement during a left-arm run.")
-            position, rotation, opening = clamp_pose(
-                decision.left_target_pos, decision.left_target_rpy, decision.left_gripper, actual,
-                self.gripper_limits["left"],
-                WorkspaceLimits(max_step_pos_m=DIRECT_MAX_STEP_POS_M, max_step_rot_rad=DIRECT_MAX_STEP_ROT_RAD),
-            )
-            if math.dist(position, start_position) > DIRECT_MAX_TRAVEL_RADIUS_M:
-                raise RuntimeError("The target exceeds the 35 cm travel radius for this run.")
-            measured = dict(zip(current.name, current.position))
-            moving = (
-                math.dist(position, actual.position) > 0.0005
-                or rotation_distance(actual.rotation_rpy, matrix_to_rpy(rotation)) > 0.004
-            )
-            joints = pose_target(self.chains["left"], measured, position, rotation) if moving else None
-            if stop.is_set() or time.monotonic() >= expires_at:
-                raise RuntimeError("The run stopped or the observation expired before dispatch.")
-            if joints is not None:
-                names = list(joints.keys())
-                q_start = np.array([measured[name] for name in names], dtype=float)
-                q_goal = np.array([joints[name] for name in names], dtype=float)
-                max_dq = float(np.max(np.abs(q_goal - q_start)))
-                substeps = max(1, math.ceil(1.9 * max_dq / DIRECT_SUBSTEP_MAX_JOINT_RAD))
-                for step_idx in range(1, substeps + 1):
-                    if stop.is_set() or time.monotonic() >= expires_at:
-                        raise RuntimeError("The run stopped or the observation expired before dispatch.")
-                    blend = _min_jerk(step_idx / substeps)
-                    q_cmd = q_start + blend * (q_goal - q_start)
-                    self._busy_until = time.monotonic() + 0.25
-                    result = controller.set_joint_positions(
-                        self.command_type(positions=q_cmd.tolist()), timeout=1
+            for decision in decisions:
+                if (
+                    math.dist(observation.right_ee.position, decision.right_target_pos) > 0.001
+                    or rotation_distance(observation.right_ee.rotation_rpy, decision.right_target_rpy) > 0.01
+                    or abs(observation.right_ee.gripper - decision.right_gripper) > 0.02
+                ):
+                    raise RuntimeError("Claude requested right-arm movement during a left-arm run.")
+
+            # Pre-solve all Cartesian knots and validate limits before sending any motion.
+            names = [f"left_arm_joint{i}" for i in range(1, 7)]
+            measured_map = dict(zip(current.name, current.position))
+            cursor = actual
+            q_cursor = np.array([measured_map[name] for name in names], dtype=float)
+            actions: list[tuple[str, Any]] = []
+            pending_knots: list[np.ndarray] = [q_cursor]
+
+            for decision in decisions:
+                position, rotation, opening = clamp_pose(
+                    decision.left_target_pos, decision.left_target_rpy, decision.left_gripper, cursor,
+                    self.gripper_limits["left"],
+                    WorkspaceLimits(max_step_pos_m=DIRECT_MAX_STEP_POS_M, max_step_rot_rad=DIRECT_MAX_STEP_ROT_RAD),
+                )
+                if math.dist(position, start_position) > DIRECT_MAX_TRAVEL_RADIUS_M:
+                    raise RuntimeError("The target exceeds the 35 cm travel radius for this run.")
+                rot_mat_start = rpy_to_matrix(cursor.rotation_rpy)
+                pos_dist = math.dist(position, cursor.position)
+                rot_dist = rotation_distance(cursor.rotation_rpy, matrix_to_rpy(rotation))
+                moving = pos_dist > 0.0005 or rot_dist > 0.004
+                if moving:
+                    n_knots = max(
+                        1,
+                        math.ceil(pos_dist / DIRECT_KNOT_STEP_POS_M),
+                        math.ceil(rot_dist / DIRECT_KNOT_STEP_ROT_RAD),
                     )
-                    if not result.is_success:
-                        raise RuntimeError(f"SDK rejected the jog: {result.error_message}")
-                    if step_idx < substeps and stop.wait(DIRECT_INTERP_PERIOD_S):
-                        raise RuntimeError("Direct Claude control stopped.")
+                    omega = _so3_log(rot_mat_start.T @ rotation)
+                    p_start = np.asarray(cursor.position, dtype=float)
+                    for knot_idx in range(1, n_knots + 1):
+                        frac = knot_idx / n_knots
+                        p_knot = p_start + frac * (position - p_start)
+                        r_knot = rot_mat_start @ _so3_exp(frac * omega)
+                        joints = pose_target(self.chains["left"], measured_map, p_knot, r_knot)
+                        measured_map.update(joints)
+                        q_cursor = np.array([joints[name] for name in names], dtype=float)
+                        pending_knots.append(q_cursor)
+                    cursor = ArmState(
+                        position=position.tolist(),
+                        rotation_rpy=matrix_to_rpy(rotation),
+                        gripper=cursor.gripper,
+                    )
+                if abs(opening - cursor.gripper) > 0.025:
+                    if len(pending_knots) > 1:
+                        actions.append(("arm", pending_knots))
+                        pending_knots = [q_cursor]
+                    actions.append(("gripper", (cursor.gripper, opening)))
+                    cursor = ArmState(
+                        position=list(cursor.position),
+                        rotation_rpy=list(cursor.rotation_rpy),
+                        gripper=opening,
+                    )
+            if len(pending_knots) > 1:
+                actions.append(("arm", pending_knots))
+            if not actions:
+                return "hold"
+
+            did_arm = False
+            did_grip = False
+            for kind, payload in actions:
+                if kind == "arm":
+                    self._stream_joint_knots(controller, payload, stop, expires_at)
+                    did_arm = True
+                else:
+                    g_from, g_to = payload
+                    self._send_gripper_smooth(g_from, g_to, stop, expires_at)
+                    did_grip = True
+            if did_arm:
                 self._wait_arm_settled(controller, "left", stop)
-                self._busy_until = time.monotonic() + 0.08
+            self._busy_until = time.monotonic() + 0.08
+            if did_arm and did_grip:
+                return "continuous left arm and gripper sequence accepted by SDK"
+            if did_arm:
                 return "left arm target accepted by SDK"
-            if abs(opening - actual.gripper) > 0.025:
-                delta_g = opening - actual.gripper
-                g_steps = max(1, math.ceil(abs(delta_g) / 0.35))
-                for g_idx in range(1, g_steps + 1):
-                    if stop.is_set() or time.monotonic() >= expires_at:
-                        raise RuntimeError("The run stopped or the observation expired before dispatch.")
-                    g_cmd = actual.gripper + _min_jerk(g_idx / g_steps) * delta_g
-                    self._busy_until = time.monotonic() + 0.35
-                    result = self.robot.left_gripper.set_position(
-                        self.gripper_type(position=float(g_cmd)), timeout=2
-                    )
-                    if not result.is_success:
-                        raise RuntimeError(f"SDK rejected the gripper target: {result.error_message}")
-                    if g_idx < g_steps and stop.wait(0.05):
-                        raise RuntimeError("Direct Claude control stopped.")
-                stop.wait(0.2)
-                self._busy_until = time.monotonic() + 0.08
-                return "left gripper target accepted by SDK"
-            return "hold"
+            return "left gripper target accepted by SDK"
+
+    def apply_direct(
+        self, observation: ValidatedRequest, decision: PlannerDecision,
+        start_position: list[float], stop: threading.Event, expires_at: float,
+    ) -> str:
+        return self.apply_direct_sequence(observation, [decision], start_position, stop, expires_at)
 
     def action(self, arm: str, action: str) -> str:
         if action not in ("home", "open", "close"):

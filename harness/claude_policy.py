@@ -23,7 +23,7 @@ from trajectory import rotation_distance
 
 DEFAULT_CLAUDE_KEY_FILE = Path.home() / ".config" / "anthropic" / "api_key"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
-MAX_WAYPOINTS = 3
+MAX_WAYPOINTS = 4
 
 SYSTEM_PROMPT = """You autonomously control a bimanual desktop robot (quanta_x1_pro) via EndPose targets.
 
@@ -37,8 +37,8 @@ Coordinate frame & camera layout:
 Control guidelines:
 1. Break any natural-language task into smooth sequential stages:
    approach_above -> align_xy -> descend -> grasp (hold position while closing gripper) -> lift -> transport -> place -> release (hold position while opening gripper) -> retreat -> completed.
-2. Return one to three sequential waypoints for the current stage. Use absolute base-frame positions in meters and RPY in radians. Keep each leg short (roughly <= 0.08 m and <= 0.40 rad), clear of the tabletop, both arms and visible obstacles. Give each arm's full pose and gripper when commanding it. Omit any idle arm.
-3. Use feedback from all three cameras and the measured end-effector poses. Stop the current plan at a point where new visual evidence is required, for example after closing a gripper and before attempting a lift.
+2. Return one to four sequential waypoints for the current stage. Use absolute base-frame positions in meters and RPY in radians. Keep each leg short (roughly <= 0.08 m and <= 0.40 rad), clear of the tabletop, both arms and visible obstacles. Give each arm's full pose and gripper when commanding it. Omit any idle arm.
+3. Use feedback from all three cameras and the measured end-effector poses. Stop the current plan at a point where new visual evidence is required, for example before closing on an unverified target or after lifting.
 4. If the scene is ambiguous, the path cannot be estimated from the views, or a grasp is uncertain, return status="retry" and an empty waypoints array. Explain what blocked planning.
 5. Return status="completed" with an empty waypoints array only when fresh observations show the task goal is satisfied. The controller will hold the measured pose.
 
@@ -473,6 +473,22 @@ class ClaudeEndPosePlanner:
         )
         self._cached_decision = decision
         return decision
+
+    def decide_sequence(self, req: ValidatedRequest) -> list[PlannerDecision]:
+        """Return all planned sequential waypoints for unbroken direct-SDK execution."""
+        first = self.decide(req)
+        if first.status in ("completed", "retry") or not self._waypoints:
+            return [first]
+        decisions = [first]
+        for idx in range(self._waypoint_index + 1, len(self._waypoints)):
+            item = _decision_from_parsed(req, {**self._plan, **self._waypoints[idx]})
+            item.waypoint_index = idx + 1
+            item.waypoint_count = len(self._waypoints)
+            decisions.append(item)
+        self._waypoint_index = len(self._waypoints)
+        if self.history:
+            self.history[-1]["reached_waypoints"] = len(self._waypoints)
+        return decisions
 
 
 class HeuristicOfflinePlanner:

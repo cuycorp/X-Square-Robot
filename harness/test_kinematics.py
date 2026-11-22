@@ -330,3 +330,80 @@ class TestKinematicsPreview(unittest.TestCase):
             )
         self.assertEqual(result["cube_top_center_m"], [0.25, 0.1, 0.055])
         self.assertAlmostEqual(result["table_z_m"], 0)
+
+    def test_continuous_multi_waypoint_grasp_sequence_executes_unbroken(self) -> None:
+        from protocol import validate_request
+
+        robot = Mock()
+        robot.robot_control.get_manipulator_control_mode.return_value.mode = 1
+        seed = {**self.joints, "left_arm_joint2": 0.35, "left_arm_joint3": -0.60}
+        left_positions = list(seed.values())
+        left_gripper_val = 1.2
+        ticks = iter(range(1, 200))
+
+        def feedback(arm):
+            return SimpleNamespace(
+                header=SimpleNamespace(stamp=SimpleNamespace(sec=1, nanosec=next(ticks))),
+                name=[name.replace("left", arm) for name in seed],
+                position=left_positions.copy() if arm == "left" else list(seed.values()),
+                velocity=[0] * 6,
+            )
+
+        robot.left_arm.get_joint_states.side_effect = lambda **_: feedback("left")
+        robot.right_arm.get_joint_states.side_effect = lambda **_: feedback("right")
+        robot.left_gripper.get_position.side_effect = lambda **_: SimpleNamespace(position=left_gripper_val)
+        robot.right_gripper.get_position.return_value.position = 1.2
+
+        def accept_joints(command, **_):
+            left_positions[:] = command.positions
+            return SimpleNamespace(is_success=True)
+
+        def accept_gripper(command, **_):
+            nonlocal left_gripper_val
+            left_gripper_val = command.position
+            return SimpleNamespace(is_success=True)
+
+        robot.left_arm.set_joint_positions.side_effect = accept_joints
+        robot.left_gripper.set_position.side_effect = accept_gripper
+
+        jogger = DesktopJogger(robot, 1, SimpleNamespace, self.urdf, SimpleNamespace)
+        stop = threading.Event()
+        jogger.reserve_direct(stop)
+        try:
+            states = jogger.observe_direct(stop)
+            obs_payload = build_observation_payload(TabletopState(), "Grasp and lift the cube")
+            obs_payload["observation"]["state"] = states
+            req = validate_request(obs_payload)
+            p0 = list(req.left_ee.position)
+            r0 = list(req.left_ee.rotation_rpy)
+            waypoints = [
+                {"left_ee": {"position": [p0[0] - 0.04, p0[1], p0[2]], "rotation_rpy": r0, "gripper": 1.2}},
+                {"left_ee": {"position": [p0[0] - 0.04, p0[1], p0[2] - 0.04], "rotation_rpy": r0, "gripper": 1.2}},
+                {"left_ee": {"position": [p0[0] - 0.04, p0[1], p0[2] - 0.04], "rotation_rpy": r0, "gripper": 0.1}},
+                {"left_ee": {"position": [p0[0] - 0.04, p0[1], p0[2] + 0.01], "rotation_rpy": r0, "gripper": 0.1}},
+            ]
+            planner = ClaudeEndPosePlanner(api_key="test-key")
+            with patch.object(planner, "_post_messages", return_value={
+                "content": [{"type": "text", "text": json.dumps({
+                    "stage": "pick_and_lift",
+                    "status": "in_progress",
+                    "reason": "Approach, descend, grasp, and lift",
+                    "waypoints": waypoints,
+                })}]
+            }):
+                seq = planner.decide_sequence(req)
+            self.assertEqual(len(seq), 4)
+            import time as _t
+            action = jogger.apply_direct_sequence(req, seq, p0, stop, _t.monotonic() + 20)
+            self.assertIn("continuous left arm and gripper sequence", action)
+            prev_q = np.array(list(seed.values()), dtype=float)
+            for call in robot.left_arm.set_joint_positions.call_args_list:
+                next_q = np.array(call.args[0].positions, dtype=float)
+                self.assertLessEqual(float(np.max(np.abs(next_q - prev_q))), np.deg2rad(0.65))
+                prev_q = next_q
+            self.assertAlmostEqual(left_gripper_val, 0.1, places=4)
+            end_pose = preview(self.urdf, "left", dict(zip(seed, left_positions)), None)["pose"]
+            np.testing.assert_allclose(np.subtract(end_pose[:3], p0), [-0.04, 0.0, 0.01], atol=0.002)
+        finally:
+            jogger.finish_direct(stop)
+
