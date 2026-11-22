@@ -468,3 +468,44 @@ class TestKinematicsPreview(unittest.TestCase):
         self.assertIn("do not abort", planner.decide.call_args.args[0].instruction)
         robot.left_arm.set_joint_positions.assert_called()
 
+    def test_read_camera_snapshot_returns_promptly_when_depth_fails(self) -> None:
+        import time as _t
+        from direct_claude import read_camera_snapshot
+
+        events = [
+            {"op": "publish", "topic": "/camera_head_front/color/image_raw/compressed", "msg": {"format": "jpeg", "data": "f", "header": {"stamp": {"sec": 1, "nanosec": 10}}}},
+            {"op": "publish", "topic": "/camera3/usb_cam3/image_raw/image_compressed", "msg": {"format": "jpeg", "data": "l"}},
+            {"op": "publish", "topic": "/camera1/usb_cam1/image_raw/image_compressed", "msg": {"format": "jpeg", "data": "r"}},
+            {"op": "publish", "topic": "/camera_head_front/color/camera_info", "msg": {"header": {"frame_id": "c"}}},
+            {"op": "publish", "topic": "/camera_head_front/depth/camera_info", "msg": {"header": {"frame_id": "d"}}},
+            {"op": "publish", "topic": "/tf_static", "msg": {"transforms": [{"child_frame_id": "c"}]}},
+            {"op": "publish", "topic": "/camera_head_front/depth/image_raw/compressedDepth", "msg": {"header": {"stamp": {"sec": 1, "nanosec": 10}}}},
+        ]
+
+        class FakeSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def send(self, _):
+                pass
+
+            def recv(self, timeout=0.25):
+                if events:
+                    return json.dumps(events.pop(0))
+                _t.sleep(min(0.05, timeout))
+                raise TimeoutError()
+
+        t0 = _t.monotonic()
+        with (
+            patch("direct_claude.connect", return_value=FakeSocket()),
+            patch("direct_claude.localize_cube", side_effect=ValueError("Could not verify the cube's top and side in the front view.")),
+        ):
+            images, measured = read_camera_snapshot("ws://127.0.0.1:1/", threading.Event(), front_mount=np.eye(4))
+        elapsed = _t.monotonic() - t0
+        self.assertEqual(images, {"front": "f", "left_wrist": "l", "right_wrist": "r"})
+        self.assertEqual(measured["status"], "unavailable")
+        self.assertLess(elapsed, 1.5)
+

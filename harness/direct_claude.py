@@ -27,22 +27,21 @@ OPERATOR_TIMEOUT = 6.0
 BASE_TASK_CONTEXT = (
     "Use only the left arm and omit right_ee from every waypoint. "
     "Reported poses are gripper-base poses in the robot base_link frame. "
-    "Sequential waypoints in your waypoints list (up to 4, up to 50 mm and 20 deg per waypoint) execute continuously in one unbroken trajectory (arm sweeps, gripper change, lift) before fresh camera frames are read. "
-    "Chain consecutive waypoints such as [approach_above, descend] or [descend, grasp, lift] when the path is clear, and end the list wherever fresh visual verification is needed. "
+    "Sequential waypoints in your waypoints list (up to 4, up to 50 mm and 20 deg per waypoint, up to 20 cm total per call) execute continuously in one unbroken trajectory before fresh camera frames are read. "
+    "Maximize speed by chaining 3 to 4 waypoints whenever the path is clear (for example [approach_1, approach_2, align_above] or [descend, grasp, lift]), and only stop early right before fine alignment or grasp verification. "
     "Use last_sdk_step and since_last_plan measured displacement feedback together with the updated cameras to verify arm motion. "
     "Keep approach and gripper changes in separate waypoints. "
 )
 CUBE_DEPTH_CONTEXT = (
     "local_perception.cube_depth reports cube_top_center_m (the cube's top face, not a gripper target) and nearby table_z_m in base_link. "
     "Use its x/y for alignment and table_z_m to maintain vertical clearance. "
-    "If last_seen is present while the moving arm briefly blocks the front view, rely on last_seen for the stationary tabletop cube and align visually with left_wrist. "
-    "If cube_depth reports status='unavailable' and last_seen is null (for example when an arm blocks the front view) while left_wrist clearly sees the cube, do not abort: align visually with left_wrist and front RGB in short 2 to 4 cm increments. "
+    "If last_seen is present while the moving arm briefly blocks the front view, rely on last_seen for the stationary tabletop cube and chain waypoints directly toward it. "
+    "If cube_depth reports status='unavailable' and last_seen is null while left_wrist sees the cube, do not abort: chain 4 to 5 cm waypoints along the clear approach direction and use 2 to 3 cm steps only for final centering right above the cube. "
     "Return retry only if the target is held, missing from all views, or unsafe. "
 )
 RGB_ONLY_CONTEXT = (
     "RGB-only mode (no depth measurement is attached): do not wait for cube_depth or table_z_m. "
-    "Use the front and left_wrist RGB views for progressive visual servoing in 2 to 4 cm increments while keeping safe clearance above the table. "
-    "Center the target in left_wrist before descending to grasp, and verify each move using last_sdk_step and visual parallax. "
+    "Use the front and left_wrist RGB views to chain 2 to 4 waypoints (up to 5 cm each) along clear approach paths while keeping safe clearance above the table, then center finely over the target before chaining [descend, grasp, lift]. "
     "Return retry only if the target object is missing, held or unsafe, or all camera views are blocked. "
 )
 TASK_CONTEXT = BASE_TASK_CONTEXT + CUBE_DEPTH_CONTEXT
@@ -70,23 +69,32 @@ def read_camera_snapshot(
     tested_rgb = 0
     depth_failure = "No synchronized front RGB and depth with matching calibration."
     deadline = time.monotonic() + 5
+    depth_grace_deadline: float | None = None
     with connect(url, open_timeout=3, close_timeout=0.5, max_size=4 * 1024 * 1024, proxy=None) as socket:
         topics = [*CAMERA_TOPICS, *(DEPTH_TOPICS if front_mount is not None else ())]
         for topic in topics:
-            options = {"queue_length": 1, "throttle_rate": 100}
+            if topic == "/tf_static" and static:
+                continue
+            options = {"queue_length": 1, "throttle_rate": 40}
             if topic == "/tf_static":
                 options = {"qos": {"durability": "transient_local", "reliability": "reliable", "depth": 10}}
             socket.send(json.dumps({"op": "subscribe", "topic": topic, **options}))
         while True:
             if stop.is_set():
                 raise RuntimeError("Direct Claude control stopped.")
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            if depth_grace_deadline is not None and now >= depth_grace_deadline and len(images) == len(CAMERA_TOPICS):
+                return images, {"status": "unavailable", "reason": depth_failure}
+            remaining = deadline - now
             if remaining <= 0:
                 if len(images) == len(CAMERA_TOPICS):
                     return images, {"status": "unavailable", "reason": depth_failure}
                 raise RuntimeError("Timed out waiting for all three rosbridge cameras.")
+            wait_s = min(0.25, remaining)
+            if depth_grace_deadline is not None:
+                wait_s = min(wait_s, max(0.02, depth_grace_deadline - now))
             try:
-                update = json.loads(socket.recv(timeout=min(0.5, remaining)))
+                update = json.loads(socket.recv(timeout=wait_s))
             except TimeoutError:
                 continue
             if update.get("op") != "publish":
@@ -113,6 +121,8 @@ def read_camera_snapshot(
                 continue
             if front_mount is None:
                 return images, None
+            if depth_grace_deadline is None:
+                depth_grace_deadline = min(deadline, time.monotonic() + 0.9)
             if not {"color_info", "depth_info"} <= depth_messages.keys() or not static:
                 continue
             pairs = [
@@ -132,6 +142,7 @@ def read_camera_snapshot(
                 depth_failure = str(exc)
                 if not depth_failure.startswith("Missing fixed transform"):
                     tested_rgb = _stamp(rgb)
+                    depth_grace_deadline = min(depth_grace_deadline, time.monotonic() + 0.35)
                 continue
             images["front"] = rgb["data"]
             return images, {"status": "measured", **measurement}
@@ -297,7 +308,7 @@ class DirectClaudeControl:
                     break
                 previous_left = observation.left_ee
                 previous_action = action
-                if stop.wait(0.12):
+                if stop.wait(0.05):
                     break
             else:
                 outcome, reason = "limit", "Reached the direct control observation limit."

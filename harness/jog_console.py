@@ -38,8 +38,8 @@ DIRECT_MAX_TRAVEL_RADIUS_M = 0.35
 DIRECT_KNOT_STEP_POS_M = 0.01
 DIRECT_KNOT_STEP_ROT_RAD = math.radians(5)
 DIRECT_SUBSTEP_MAX_JOINT_RAD = math.radians(0.6)
-DIRECT_INTERP_PERIOD_S = 0.022
-DIRECT_SETTLE_TIMEOUT_S = 0.6
+DIRECT_INTERP_PERIOD_S = 0.014
+DIRECT_SETTLE_TIMEOUT_S = 0.35
 
 
 class DesktopJogger:
@@ -208,9 +208,9 @@ class DesktopJogger:
             )
             if not result.is_success:
                 raise RuntimeError(f"SDK rejected the gripper target: {result.error_message}")
-            if g_idx < g_steps and stop.wait(0.05):
+            if g_idx < g_steps and stop.wait(0.035):
                 raise RuntimeError("Direct Claude control stopped.")
-        stop.wait(0.18)
+        stop.wait(0.10)
 
     def apply_direct_sequence(
         self, observation: ValidatedRequest, decisions: list[PlannerDecision],
@@ -303,7 +303,7 @@ class DesktopJogger:
                     did_grip = True
             if did_arm:
                 self._wait_arm_settled(controller, "left", stop)
-            self._busy_until = time.monotonic() + 0.08
+            self._busy_until = time.monotonic() + 0.02
             if did_arm and did_grip:
                 return "continuous left arm and gripper sequence accepted by SDK"
             if did_arm:

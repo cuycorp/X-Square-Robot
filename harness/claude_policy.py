@@ -344,6 +344,31 @@ class ClaudeEndPosePlanner:
         decision.waypoint_count = len(self._waypoints)
         return decision
 
+    @staticmethod
+    def _compact_jpeg_b64(b64_data: str, max_dim: int = 768, quality: int = 82) -> str:
+        if not b64_data:
+            return b64_data
+        try:
+            import base64
+            import io
+            from PIL import Image
+
+            raw = base64.b64decode(b64_data)
+            with Image.open(io.BytesIO(raw)) as img:
+                w, h = img.size
+                if max(w, h) <= max_dim:
+                    return b64_data
+                scale = max_dim / max(w, h)
+                resized = img.convert("RGB").resize(
+                    (max(1, round(w * scale)), max(1, round(h * scale))),
+                    Image.Resampling.BILINEAR,
+                )
+                buf = io.BytesIO()
+                resized.save(buf, format="JPEG", quality=quality)
+                return base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            return b64_data
+
     def build_request_body(self, req: ValidatedRequest) -> dict[str, Any]:
         # Claude 5.5 omits temperature, budget_tokens, and assistant prefill.
         content = [
@@ -351,17 +376,17 @@ class ClaudeEndPosePlanner:
             {"type": "text", "text": "Camera 1: front (top/head view: robot LEFT arm is on LEFT of image, RIGHT arm on RIGHT, verify against left_ee/right_ee)"},
             {
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": req.images_b64["front"]},
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": self._compact_jpeg_b64(req.images_b64["front"])},
             },
             {"type": "text", "text": "Camera 2: left_wrist"},
             {
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": req.images_b64["left_wrist"]},
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": self._compact_jpeg_b64(req.images_b64["left_wrist"])},
             },
             {"type": "text", "text": "Camera 3: right_wrist"},
             {
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": req.images_b64["right_wrist"]},
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": self._compact_jpeg_b64(req.images_b64["right_wrist"])},
             },
         ]
         return {

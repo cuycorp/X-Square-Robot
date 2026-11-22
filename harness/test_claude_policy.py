@@ -453,6 +453,23 @@ class TestStopReasonDiagnostics(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stop_reason=max_tokens"):
                 planner.decide(req)
 
+    def test_compact_jpeg_downscales_oversized_frames(self) -> None:
+        import base64
+        import io
+        from PIL import Image
+
+        big_buf = io.BytesIO()
+        Image.new("RGB", (1280, 720), (40, 120, 200)).save(big_buf, format="JPEG")
+        big_b64 = base64.b64encode(big_buf.getvalue()).decode("ascii")
+        compacted = ClaudeEndPosePlanner._compact_jpeg_b64(big_b64)
+        with Image.open(io.BytesIO(base64.b64decode(compacted))) as out_img:
+            self.assertEqual(out_img.size, (768, 432))
+
+        small_buf = io.BytesIO()
+        Image.new("RGB", (640, 480), (40, 120, 200)).save(small_buf, format="JPEG")
+        small_b64 = base64.b64encode(small_buf.getvalue()).decode("ascii")
+        self.assertEqual(ClaudeEndPosePlanner._compact_jpeg_b64(small_b64), small_b64)
+
 
 if __name__ == "__main__":
     unittest.main()
