@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 HARNESS_DIR = Path(__file__).resolve().parent
@@ -21,7 +22,7 @@ sys.path.insert(0, str(HARNESS_DIR))
 
 from claude_policy import ClaudeEndPosePlanner, HeuristicOfflinePlanner
 from cube_state import CubeStateManager, FACES, rotate_grid_cw
-from cube_vision import classify_rgb_sticker, detect_cube_cv, scan_cube_with_claude
+from cube_vision import _classify_sticker_patch, classify_rgb_sticker, detect_cube_cv, scan_cube_with_claude
 from server import DualArmPolicyEngine, PromptController, start_console_http_server
 from sim_cpu_env import TabletopState, build_observation_payload
 
@@ -204,6 +205,26 @@ class TestCubeVision(unittest.TestCase):
 
 
 class TestCubeStateAndConsoleAPI(unittest.TestCase):
+    def test_uncertain_stickers_are_left_unknown(self) -> None:
+        orange = PALETTE["O"]
+        self.assertEqual(_classify_sticker_patch(np.array([orange] * 9), list(orange))[0], "O")
+        mixed = np.array([orange] * 5 + [PALETTE["Y"]] * 4)
+        self.assertEqual(_classify_sticker_patch(mixed, list(orange))[0], "?")
+        borderline = [240, 159, 20]
+        self.assertEqual(_classify_sticker_patch(np.array([borderline] * 9), borderline)[0], "?")
+
+        state = CubeStateManager()
+        grid = [["R", "W", "G"], ["B", "Y", "O"], ["G", "W", "R"]]
+        state.update_live({"detected": True, "confidence": 0.9, "grid": grid}, source="front", auto_correlate=True)
+        self.assertEqual(state.snapshot()["faces"]["F"]["grid"][0][0], "R")
+        disagreeing = [["O", "W", "G"], ["B", "Y", "O"], ["G", "W", "R"]]
+        state.update_live({"detected": True, "confidence": 0.6, "grid": disagreeing}, source="camera1", auto_correlate=True)
+        self.assertEqual(state.snapshot()["faces"]["F"]["grid"][0], ["?", "W", "G"])
+        grid_unknown = [["?", "?", "G"], ["B", "Y", "O"], ["G", "W", "R"]]
+        state.update_live({"detected": False}, source="camera1", auto_correlate=True)
+        state.update_live({"detected": True, "confidence": 0.9, "grid": grid_unknown}, source="front", auto_correlate=True)
+        self.assertEqual(state.snapshot()["faces"]["F"]["grid"][0], ["?", "?", "G"])
+
     def test_state_validation_rotation_and_facelet_string(self) -> None:
         mgr = CubeStateManager()
         solved = {"U": "W", "R": "R", "F": "G", "D": "Y", "L": "O", "B": "B"}

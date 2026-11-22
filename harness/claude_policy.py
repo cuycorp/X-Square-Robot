@@ -226,6 +226,7 @@ def _state_summary(req: ValidatedRequest, history: list[dict[str, Any]]) -> str:
                 "gripper": round(req.right_ee.gripper, 4),
             },
             "recent_history": history[-6:],
+            **({"local_perception": req.perception} if req.perception is not None else {}),
         }
     )
 

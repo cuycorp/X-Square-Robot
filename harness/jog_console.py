@@ -12,9 +12,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from claude_policy import ClaudeEndPosePlanner, load_anthropic_api_key
-from kinematics import arm_chain, jog_target
+from claude_policy import ClaudeEndPosePlanner, PlannerDecision, load_anthropic_api_key
+from cube_depth import camera_mount
+from direct_claude import DirectClaudeControl
+from kinematics import arm_chain, jog_target, measured_pose, small_pose_target
+from protocol import ArmState, ValidatedRequest
 from server import PromptController, start_console_http_server
+from trajectory import WorkspaceLimits, clamp_pose, matrix_to_rpy, rotation_distance
 
 
 class DesktopJogger:
@@ -39,14 +43,30 @@ class DesktopJogger:
         self._lock = threading.Lock()
         self._busy_until = -math.inf
         self._released = False
+        self._direct_stop: threading.Event | None = None
+
+    def reserve_direct(self, stop: threading.Event) -> None:
+        with self._lock:
+            if self._released or self._direct_stop is not None or time.monotonic() < self._busy_until:
+                raise RuntimeError("Wait for manual motion to settle before starting Claude.")
+            self._direct_stop = stop
+
+    def finish_direct(self, stop: threading.Event) -> None:
+        with self._lock:
+            if self._direct_stop is stop:
+                self._direct_stop = None
 
     @contextmanager
-    def _stationary_arm(self, arm: str) -> Iterator[tuple[Any, Any]]:
+    def _stationary_arm(self, arm: str, *, direct_stop: threading.Event | None = None) -> Iterator[tuple[Any, Any]]:
         if arm not in self.chains:
             raise ValueError("Select the left or right arm")
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("A manual request is still in progress")
         try:
+            if self._direct_stop is not direct_stop:
+                raise RuntimeError("Manual controls are locked during direct Claude control.")
+            if direct_stop is not None and direct_stop.is_set():
+                raise RuntimeError("Direct Claude control stopped.")
             if self._released:
                 raise RuntimeError("Manual SDK control has been released.")
             if time.monotonic() < self._busy_until:
@@ -73,15 +93,83 @@ class DesktopJogger:
         finally:
             self._lock.release()
 
+    def _send_joint_target(self, controller: Any, joints: dict[str, float]) -> None:
+        command = self.command_type(positions=list(joints.values()))
+        self._busy_until = time.monotonic() + 0.4
+        result = controller.set_joint_positions(command, timeout=1)
+        if not result.is_success:
+            raise RuntimeError(f"SDK rejected the jog: {result.error_message}")
+
     def __call__(self, arm: str, axis: str, direction: int, step: float) -> dict[str, float]:
         with self._stationary_arm(arm) as (controller, current):
             joints = jog_target(self.chains[arm], dict(zip(current.name, current.position)), axis, direction, step)
-            command = self.command_type(positions=list(joints.values()))
-            self._busy_until = time.monotonic() + 0.4
-            result = controller.set_joint_positions(command, timeout=1)
-            if not result.is_success:
-                raise RuntimeError(f"SDK rejected the jog: {result.error_message}")
+            self._send_joint_target(controller, joints)
             return joints
+
+    def _measured_arm(self, arm: str, state: Any) -> dict[str, Any]:
+        measured = dict(zip(state.name, state.position))
+        position, rpy = measured_pose(self.chains[arm], measured)
+        gripper = self.robot.left_gripper if arm == "left" else self.robot.right_gripper
+        opening = float(gripper.get_position(timeout=1).position)
+        if not math.isfinite(opening):
+            raise RuntimeError("The SDK did not provide a valid gripper position.")
+        low, high = self.gripper_limits[arm]
+        if not low - 0.01 <= opening <= high + 0.01:
+            raise RuntimeError("The measured gripper position is outside the station limits.")
+        return {"position": position, "rotation_rpy": rpy, "gripper": min(high, max(low, opening))}
+
+    def observe_direct(self, stop: threading.Event) -> dict[str, Any]:
+        states = {}
+        for arm in ("left", "right"):
+            with self._stationary_arm(arm, direct_stop=stop) as (_, current):
+                states[f"{arm}_ee"] = self._measured_arm(arm, current)
+        return states
+
+    def apply_direct(
+        self, observation: ValidatedRequest, decision: PlannerDecision,
+        start_position: list[float], stop: threading.Event, expires_at: float,
+    ) -> str:
+        with self._stationary_arm("left", direct_stop=stop) as (controller, current):
+            actual = ArmState(**self._measured_arm("left", current))
+            planned_from = observation.left_ee
+            if (
+                math.dist(actual.position, planned_from.position) > 0.003
+                or rotation_distance(actual.rotation_rpy, planned_from.rotation_rpy) > math.radians(1)
+                or abs(actual.gripper - planned_from.gripper) > 0.04
+            ):
+                raise RuntimeError("The left arm moved while Claude was planning. Start a fresh run.")
+            if (
+                math.dist(observation.right_ee.position, decision.right_target_pos) > 0.001
+                or rotation_distance(observation.right_ee.rotation_rpy, decision.right_target_rpy) > 0.01
+                or abs(observation.right_ee.gripper - decision.right_gripper) > 0.02
+            ):
+                raise RuntimeError("Claude requested right-arm movement during a left-arm run.")
+            position, rotation, opening = clamp_pose(
+                decision.left_target_pos, decision.left_target_rpy, decision.left_gripper, actual,
+                self.gripper_limits["left"],
+                WorkspaceLimits(max_step_pos_m=0.005, max_step_rot_rad=math.radians(1)),
+            )
+            if math.dist(position, start_position) > 0.20:
+                raise RuntimeError("The target exceeds the 20 cm travel radius for this run.")
+            measured = dict(zip(current.name, current.position))
+            moving = (
+                math.dist(position, actual.position) > 0.0005
+                or rotation_distance(actual.rotation_rpy, matrix_to_rpy(rotation)) > 0.004
+            )
+            joints = small_pose_target(self.chains["left"], measured, position, rotation) if moving else None
+            if stop.is_set() or time.monotonic() >= expires_at:
+                raise RuntimeError("The run stopped or the observation expired before dispatch.")
+            if joints is not None:
+                self._send_joint_target(controller, joints)
+                return "left arm target accepted by SDK"
+            if abs(opening - actual.gripper) > 0.025:
+                target = actual.gripper + max(-0.15, min(0.15, opening - actual.gripper))
+                self._busy_until = time.monotonic() + 0.4
+                result = self.robot.left_gripper.set_position(self.gripper_type(position=target), timeout=2)
+                if not result.is_success:
+                    raise RuntimeError(f"SDK rejected the gripper target: {result.error_message}")
+                return "left gripper target accepted by SDK"
+            return "hold"
 
     def action(self, arm: str, action: str) -> str:
         if action not in ("home", "open", "close"):
@@ -108,6 +196,8 @@ class DesktopJogger:
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Wait for the current manual request to finish.")
         try:
+            if self._direct_stop is not None:
+                raise RuntimeError("Stop direct Claude control before releasing the SDK.")
             if time.monotonic() < self._busy_until:
                 raise RuntimeError("Wait for the previous motion to settle.")
             self._released = True
@@ -147,9 +237,13 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--sdk-address", help="Exclusive Desktop SDK session in host:port form")
     parser.add_argument("--urdf", type=Path, help="Trusted URDF matching the station, required for SDK jogging")
+    parser.add_argument("--direct-rosbridge", help="Enable direct Claude control with this robot's rosbridge URL")
     args = parser.parse_args()
     if bool(args.sdk_address) != bool(args.urdf):
         parser.error("--sdk-address and --urdf must be supplied together")
+    if args.direct_rosbridge and not args.sdk_address:
+        parser.error("--direct-rosbridge requires a live SDK connection")
+    front_mount = camera_mount(args.urdf.read_text(encoding="utf-8")) if args.direct_rosbridge else None
     jogger = connect_desktop(args.sdk_address, args.urdf) if args.sdk_address else None
     stop = threading.Event()
 
@@ -163,11 +257,16 @@ def main() -> None:
         return "Manual SDK server is stopping. Wait for the robot to return to idle before starting evaluation."
 
     key_planner = ClaudeEndPosePlanner(api_key=load_anthropic_api_key())
+    prompt_ctrl = PromptController()
+    direct = DirectClaudeControl(
+        jogger, key_planner, prompt_ctrl, args.direct_rosbridge,
+        front_mount=front_mount,
+    ) if args.direct_rosbridge else None
     server = start_console_http_server(
-        "127.0.0.1", args.port, PromptController(),
+        "127.0.0.1", args.port, prompt_ctrl,
         live_jog=jogger, live_action=jogger.action if jogger else None,
         release_manual=release_manual if jogger else None, prompts_enabled=False,
-        key_planner=key_planner,
+        key_planner=key_planner, direct_control=direct,
     )
     print(f"Console at http://127.0.0.1:{server.server_port}/", flush=True)
     try:
@@ -175,6 +274,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if direct is not None:
+            direct.stop()
         server.shutdown()
         server.server_close()
 

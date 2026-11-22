@@ -305,9 +305,9 @@ class CubeStateManager:
         elif stored_u is not None:
             anchor_u = [list(row) for row in stored_u]
 
-        # Votes per canonical face -> (r, c) -> color -> total_weight
-        votes: dict[str, list[list[dict[str, float]]]] = {
-            f: [[{} for _ in range(3)] for _ in range(3)] for f in FACES
+        # Keep the distinct colors observed at each canonical sticker position.
+        observations: dict[str, list[list[set[str]]]] = {
+            f: [[set() for _ in range(3)] for _ in range(3)] for f in FACES
         }
         face_sources: dict[str, list[str]] = {f: [] for f in FACES}
         face_confs: dict[str, list[float]] = {f: [] for f in FACES}
@@ -341,14 +341,12 @@ class CubeStateManager:
             if u_vf is not None:
                 u_obs = normalize_grid(u_vf.get("grid"))
                 u_canon = rotate_grid_cw(u_obs, (4 - k_total) % 4)
-                known_u = sum(1 for r in u_canon for c in r if c != UNKNOWN)
                 conf_u = float(u_vf.get("confidence", det.get("confidence", 0.5)))
-                weight_u = max(0.2, conf_u) * (1.0 + 0.25 * known_u / 9.0) * (1.15 if role == "front" else 1.0)
                 for r in range(3):
                     for c in range(3):
                         col = u_canon[r][c]
                         if col != UNKNOWN:
-                            votes["U"][r][c][col] = votes["U"][r][c].get(col, 0.0) + weight_u
+                            observations["U"][r][c].add(col)
                 if src not in face_sources["U"]:
                     face_sources["U"].append(src)
                 face_confs["U"].append(conf_u)
@@ -368,16 +366,12 @@ class CubeStateManager:
                     offset = 1 if local_face == "R" else (3 if local_face == "L" else s_idx)
                     canon_face = SIDE_RING[(k_total + offset) % 4]
                 s_grid = normalize_grid(svf.get("grid"))
-                known_s = sum(1 for r in s_grid for c in r if c != UNKNOWN)
-                if known_s == 0:
-                    continue
                 conf_s = float(svf.get("confidence", det.get("confidence", 0.5)))
-                weight_s = max(0.2, conf_s) * (1.0 + 0.25 * known_s / 9.0) * (1.15 if role == "front" else 1.0)
                 for r in range(3):
                     for c in range(3):
                         col = s_grid[r][c]
                         if col != UNKNOWN:
-                            votes[canon_face][r][c][col] = votes[canon_face][r][c].get(col, 0.0) + weight_s
+                            observations[canon_face][r][c].add(col)
                 if src not in face_sources[canon_face]:
                     face_sources[canon_face].append(src)
                 face_confs[canon_face].append(conf_s)
@@ -400,55 +394,24 @@ class CubeStateManager:
             voted_known = 0
             for r in range(3):
                 for c in range(3):
-                    cell_votes = votes[fkey][r][c]
-                    if cell_votes:
-                        voted_grid[r][c] = max(cell_votes.items(), key=lambda kv: kv[1])[0]
+                    colors = observations[fkey][r][c]
+                    if len(colors) == 1:
+                        voted_grid[r][c] = next(iter(colors))
                         voted_known += 1
-            if voted_known == 0:
-                continue
-            correlated_faces.append(fkey)
+            if voted_known:
+                correlated_faces.append(fkey)
 
             if auto_fill:
                 cur_face = self._faces[fkey]
                 cur_mode = cur_face.get("mode", "")
                 if cur_mode in ("manual", "claude"):
-                    # Do not overwrite manually captured/edited or Claude-verified cells; only fill '?' if empty.
-                    merged = [list(row) for row in cur_face["grid"]]
-                    changed = False
-                    for r in range(3):
-                        for c in range(3):
-                            if merged[r][c] == UNKNOWN and voted_grid[r][c] != UNKNOWN:
-                                merged[r][c] = voted_grid[r][c]
-                                changed = True
-                    if changed:
-                        cur_face["grid"] = merged
-                        cur_face["sources"] = sorted(set(cur_face.get("sources", []) + face_sources[fkey]))
-                        cur_face["updated_at"] = now
                     continue
 
-                # Merge with prior auto observations on the same face (if center compatible) so temporary occlusions don't drop stickers.
-                prior_grid = cur_face["grid"]
-                prior_center = prior_grid[1][1]
-                new_center = voted_grid[1][1]
-                same_face_identity = (
-                    not cur_face["scanned"]
-                    or prior_center == UNKNOWN
-                    or new_center == UNKNOWN
-                    or prior_center == new_center
-                )
-                merged_grid = empty_grid()
-                for r in range(3):
-                    for c in range(3):
-                        if voted_grid[r][c] != UNKNOWN:
-                            merged_grid[r][c] = voted_grid[r][c]
-                        elif same_face_identity and prior_grid[r][c] != UNKNOWN:
-                            merged_grid[r][c] = prior_grid[r][c]
-                merged_known = sum(1 for r in merged_grid for c in r if c != UNKNOWN)
                 avg_conf = sum(face_confs[fkey]) / max(1, len(face_confs[fkey]))
-                eff_conf = round(avg_conf * (0.5 + 0.5 * (merged_known / 9.0)), 3)
+                eff_conf = round(avg_conf * (0.5 + 0.5 * (voted_known / 9.0)), 3)
                 self._faces[fkey] = {
-                    "grid": merged_grid,
-                    "scanned": merged_known > 0,
+                    "grid": voted_grid,
+                    "scanned": voted_known > 0,
                     "source": "+".join(face_sources[fkey]),
                     "sources": list(face_sources[fkey]),
                     "mode": "auto",

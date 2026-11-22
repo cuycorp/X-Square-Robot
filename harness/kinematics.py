@@ -154,6 +154,25 @@ def preview(urdf: str, arm: str, measured: dict[str, float], target: list[float]
     return _solve(chain, names, angles, lower, upper, desired[:3], rpy_to_matrix(desired[3:]))
 
 
+def measured_pose(chain: list[Joint], measured: dict[str, float]) -> tuple[list[float], list[float]]:
+    _, angles, _, _ = _joint_state(chain, measured)
+    transform, _ = _forward(chain, angles)
+    return transform[:3, 3].tolist(), matrix_to_rpy(transform[:3, :3])
+
+
+def small_pose_target(
+    chain: list[Joint], measured: dict[str, float], position: np.ndarray, rotation: np.ndarray
+) -> dict[str, float]:
+    names, angles, lower, upper = _joint_state(chain, measured)
+    solution = _solve(chain, names, angles, lower, upper, position, rotation, 0.00025, 0.003)
+    if not solution["converged"]:
+        raise ValueError("No joint solution for this increment")
+    joints = solution["joints"]
+    if max(abs(joints[name] - angle) for name, angle in zip(names, angles)) > math.radians(3):
+        raise ValueError("This Cartesian step requires more than 3 degrees at a joint. Try a smaller increment.")
+    return joints
+
+
 def jog_target(
     chain: list[Joint], measured: dict[str, float], axis: str, direction: int, step: float
 ) -> dict[str, float]:
@@ -188,10 +207,4 @@ def jog_target(
         position[axis_index] += increment
     else:
         rotation = _so3_exp(np.eye(3)[axis_index - 3] * increment) @ rotation
-    solution = _solve(chain, names, angles, lower, upper, position, rotation, 0.00025, 0.003)
-    if not solution["converged"]:
-        raise ValueError("No joint solution for this increment")
-    joints = solution["joints"]
-    if max(abs(joints[name] - angle) for name, angle in zip(names, angles)) > math.radians(3):
-        raise ValueError("This Cartesian step requires more than 3 degrees at a joint. Try a smaller increment.")
-    return joints
+    return small_pose_target(chain, measured, position, rotation)

@@ -59,6 +59,7 @@ class ValidatedRequest:
     use_rtc: bool = False
     inference_delay: int | None = None
     prev_action_chunk: dict[str, Any] | None = None
+    perception: dict[str, Any] | None = None
 
 
 def handshake_metadata() -> dict[str, str]:

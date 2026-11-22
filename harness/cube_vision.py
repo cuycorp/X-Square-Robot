@@ -360,6 +360,24 @@ def classify_rgb_sticker(rgb_triplet: list[int] | np.ndarray) -> tuple[str, floa
     return "O", round(min(1.0, 0.50 + 0.40 * s), 3)
 
 
+def _classify_sticker_patch(pixels: np.ndarray, median: list[int]) -> tuple[str, float]:
+    """Abstain when a patch is mixed or its color lies near a decision boundary."""
+    code, confidence = classify_rgb_sticker(median)
+    if code == "?":
+        return code, confidence
+    similar = np.max(np.abs(pixels.astype(np.int16) - median), axis=1) <= 40
+    if np.mean(similar) < 0.75:
+        return "?", 0.15
+    hue, saturation, value = _rgb_to_hsv_np(np.array([[median]], dtype=np.float32))
+    h, s, v = float(hue.item()), float(saturation.item()), float(value.item())
+    if code == "W":
+        if s > 0.20 or v < 0.50:
+            return "?", 0.15
+    elif s < 0.32 or 268 <= h < 315 or any(abs(h - edge) < 4 for edge in (17, 38, 76, 175, 268, 315)):
+        return "?", 0.15
+    return code, confidence
+
+
 def _bilinear_point(quad: np.ndarray, u: float, v: float) -> tuple[float, float]:
     tl, tr, br, bl = quad
     top = tl * (1.0 - u) + tr * u
@@ -806,7 +824,7 @@ def _sample_lattice_face(
             med = np.median(samp, axis=0)
             med_int = [int(round(med[0])), int(round(med[1])), int(round(med[2]))]
             cell_rgb[r][c] = med_int
-            code, c_conf = classify_rgb_sticker(med_int)
+            code, c_conf = _classify_sticker_patch(sub, med_int)
 
             if is_side:
                 if occlusion_mask is not None and occlusion_mask[iy, ix]:
@@ -1232,7 +1250,7 @@ def _detect_cube_blob_cluster(
             med_int = [int(round(med[0])), int(round(med[1])), int(round(med[2]))]
             cell_rgb[r_idx][c_idx] = med_int
 
-            color_code, c_conf = classify_rgb_sticker(med_int)
+            color_code, c_conf = _classify_sticker_patch(patch, med_int)
             grid[r_idx][c_idx] = color_code
             cell_confs.append(c_conf)
 
@@ -1318,7 +1336,7 @@ Identify every clearly visible 3x3 face of the cube and output ONE JSON object s
   }
 }
 Rules:
-- Color codes MUST be one of: W (White), Y (Yellow), R (Red), O (Orange), B (Blue), G (Green), or ? if occluded.
+- Color codes MUST be one of: W (White), Y (Yellow), R (Red), O (Orange), B (Blue), G (Green), or ? for any occluded, ambiguous, or conflicting sticker. Never guess a sticker color.
 - Face keys in "faces" must be from U, R, F, D, L, B matching standard relative cube geometry (F facing the camera, U on top, R on right, L on left, D on bottom, B in back).
 - primary_quad coordinates are normalized [0.0..1.0] [TL, TR, BR, BL] of the primary visible face in the first image (or null if uncertain).
 - Read each 3x3 grid strictly row-by-row from top-left to bottom-right as viewed from outside that face.

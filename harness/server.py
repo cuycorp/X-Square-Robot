@@ -32,6 +32,7 @@ from claude_policy import (
 )
 from cube_state import CubeStateManager
 from cube_vision import detect_cube_cv, scan_cube_with_claude
+from direct_claude import DirectClaudeControl
 from kinematics import arm_chain, jog_target, preview as preview_kinematics
 from protocol import (
     ProtocolError,
@@ -74,6 +75,7 @@ class PromptController:
             "connected": False,
             "left_ee": None,
             "right_ee": None,
+            "motion_feedback": None,
             "latency_ms": None,
             "last_error": "",
             "updated_at": time.time(),
@@ -97,6 +99,7 @@ class PromptController:
                 self._status["stage"] = "new_prompt"
                 self._status["reason"] = f"New prompt queued: {cleaned}"
                 self._status["last_error"] = ""
+                self._status["motion_feedback"] = None
             self._status["updated_at"] = time.time()
             return self._prompt_version
 
@@ -118,6 +121,10 @@ class PromptController:
                 self._status["waypoint_count"] = 0
             self._status["updated_at"] = time.time()
 
+    def finish_direct(self, status: str, reason: str) -> None:
+        with self._lock:
+            self._status.update(connected=False, status=status, reason=reason, updated_at=time.time())
+
     def record_step(
         self,
         *,
@@ -129,6 +136,7 @@ class PromptController:
         images_b64: dict[str, str],
         latency_ms: float,
         last_error: str = "",
+        motion_feedback: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
             self._status.update(
@@ -145,6 +153,7 @@ class PromptController:
                     "right_ee": right_ee,
                     "latency_ms": round(latency_ms, 1),
                     "last_error": last_error,
+                    "motion_feedback": motion_feedback,
                     "updated_at": time.time(),
                 }
             )
@@ -156,6 +165,7 @@ class PromptController:
                     "status": decision.status,
                     "reason": decision.reason,
                     "latency_ms": round(latency_ms, 1),
+                        "motion_feedback": motion_feedback,
                 }
             )
 
@@ -647,13 +657,16 @@ CONSOLE_HTML = r"""<!doctype html>
         <button type="submit">Verify Key</button>
       </form>
       <p id="key-status" class="hint" role="status"></p>
-      <form id="pform" class="row" data-enabled="true">
+      <form id="pform" class="row" data-enabled="true" data-direct="false">
         <input id="prompt" type="text" required placeholder="Pick up the spoon and place it into the blue bowl.">
         <button type="submit">Run Zero-Shot Prompt</button>
-        <button type="button" class="sec" onclick="sendPrompt('Hold current pose safely.')">Hold Pose</button>
+        <button id="hold-prompt" type="button" class="sec" onclick="sendPrompt('Hold current pose safely.')">Hold Pose</button>
         <button id="use-webui-case" type="button" class="sec" onclick="sendPrompt('')">Use WebUI Case</button>
+        <label id="cube-depth-option" hidden><input id="use-cube-depth" type="checkbox" checked> Use depth for cube position</label>
       </form>
+      <button id="direct-stop" class="sec" type="button" hidden>Stop Claude Control</button>
       <p id="prompt-status" class="hint" role="status"></p>
+      <p id="motion-feedback" class="hint" role="status"></p>
       <p id="conn" class="hint">Waiting for WebUI Start</p>
     </section>
   </aside>
@@ -663,7 +676,7 @@ CONSOLE_HTML = r"""<!doctype html>
       <h2 id="inference-title">Inference details</h2>
       <button type="button" class="sec" data-close>Close</button>
     </div>
-    <p class="warn">Use <b>End Evaluation Inference Mode</b> in the robot WebUI to end an inference run.</p>
+    <p class="warn" id="inference-stop-hint">Use <b>End Evaluation Inference Mode</b> in the robot WebUI to end an inference run.</p>
   <div class="meta">
     <div class="kv"><b>Status / Stage</b><span id="st">-</span></div>
     <div class="kv"><b>Waypoint</b><span id="waypoint">-</span></div>
@@ -671,7 +684,7 @@ CONSOLE_HTML = r"""<!doctype html>
     <div class="kv"><b>Active Goal</b><span id="goal">-</span></div>
   </div>
   <div class="card">
-    <b>Claude Reasoning</b>
+    <b>Claude plan from the pre-command observation</b>
     <p id="reason" style="margin:6px 0 0">-</p>
     <p id="err" style="margin:6px 0 0;color:#c0392b"></p>
   </div>
@@ -714,6 +727,9 @@ const releaseStatus = document.getElementById('release-status');
 const releaseButton = document.getElementById('release-sdk');
 const promptForm = document.getElementById('pform');
 const promptsEnabled = promptForm.dataset.enabled === 'true';
+const directControl = promptForm.dataset.direct === 'true';
+const directStopButton = document.getElementById('direct-stop');
+let directRequestPending = false;
 const manualPromptMessage = 'Zero-shot runs in the Claude policy console after the manual SDK session ends.';
 const keyForm = document.getElementById('key-form');
 const keyStatus = document.getElementById('key-status');
@@ -790,9 +806,10 @@ function renderJointAngles() {
   }
   const ready = ikReady();
   for (const button of ikButtons) button.disabled = !ready || ikPending;
-  releaseButton.disabled = jogPending || manualReleased;
+  const directActive = directControl && (policyConnected || directRequestPending);
+  releaseButton.disabled = jogPending || manualReleased || directActive;
   for (const [arm, panel] of armPanels) {
-    const disabled = !ikReady(arm) || jogPending || manualReleased;
+    const disabled = !ikReady(arm) || jogPending || manualReleased || directActive;
     for (const button of panel.buttons) {
       button.disabled = disabled || (Boolean(button.dataset.action) && !manualEnabled);
     }
@@ -1121,23 +1138,68 @@ async function sendPrompt(val) {
     feedback.textContent = manualPromptMessage;
     return;
   }
-  if (!keyReady) return;
+  if (!keyReady || (directControl && (policyConnected || directRequestPending))) return;
+  if (directControl) {
+    directRequestPending = true;
+    updatePromptAvailability();
+    renderJointAngles();
+  }
   try {
     const response = await fetch('/api/prompt', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: val })
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(directControl ? { prompt: val, use_cube_depth: document.getElementById('use-cube-depth').checked } : { prompt: val })
     });
-    if (!response.ok) throw new Error('The console did not accept the prompt.');
+    if (!response.ok) throw new Error((await response.json()).error || 'The console did not accept the prompt.');
     if (val) document.getElementById('prompt').value = val;
-    feedback.textContent = val
+    feedback.textContent = directControl
+      ? 'Started direct left-arm control.'
+      : val
       ? (policyConnected ? 'Prompt updated for the next observation.' : 'Prompt armed. Start evaluation in the robot WebUI.')
       : 'Using the task from the robot WebUI.';
-    poll();
+    await poll();
   } catch (error) {
     feedback.textContent = error.message;
+  } finally {
+    if (directControl) {
+      directRequestPending = false;
+      updatePromptAvailability();
+      renderJointAngles();
+    }
   }
 }
 function updatePromptAvailability() {
-  for (const input of promptForm.elements) input.disabled = !promptsEnabled || !keyReady;
+  const directActive = directControl && (policyConnected || directRequestPending);
+  for (const input of promptForm.elements) input.disabled = !promptsEnabled || !keyReady || directActive;
+  directStopButton.disabled = !directActive;
+}
+if (directControl) {
+  document.getElementById('cube-depth-option').hidden = false;
+  document.getElementById('hold-prompt').hidden = true;
+  document.getElementById('inference-stop-hint').textContent = 'Use Stop Claude Control to stop sending new SDK targets.';
+  directStopButton.hidden = false;
+  directStopButton.addEventListener('click', async () => {
+    const feedback = document.getElementById('prompt-status');
+    try {
+      const response = await fetch('/api/direct/stop', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+      });
+      if (!response.ok) throw new Error('Could not stop direct control.');
+      feedback.textContent = 'Stop requested.';
+      await poll();
+    } catch (error) {
+      feedback.textContent = error.message;
+    }
+  });
+  window.addEventListener('pagehide', () => {
+    if (policyConnected || directRequestPending) fetch('/api/direct/stop', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', keepalive: true
+    }).catch(() => {});
+  });
+  setInterval(() => {
+    if (policyConnected || directRequestPending) fetch('/api/direct/heartbeat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    }).catch(() => {});
+  }, 1000);
 }
 updatePromptAvailability();
 if (!keyReady) {
@@ -1195,7 +1257,13 @@ async function poll() {
         : (promptsEnabled ? 'Verify an Anthropic key to enable prompts and Scan with Claude.' : 'Verify an Anthropic key to enable Scan with Claude.');
       updatePromptAvailability();
     }
-    document.getElementById('conn').textContent = promptsEnabled
+    if (directControl) {
+      updatePromptAvailability();
+      renderJointAngles();
+    }
+    document.getElementById('conn').textContent = directControl
+      ? (d.connected ? 'Direct SDK control active' : 'Direct SDK · ready for a left-arm task')
+      : promptsEnabled
       ? (d.connected ? 'Robot Connected' : 'Waiting for WebUI Start')
       : '';
     document.getElementById('st').textContent = (d.status || '-') + ' / ' + (d.stage || '-');
@@ -1204,6 +1272,16 @@ async function poll() {
     document.getElementById('goal').textContent = d.effective_instruction || '(from WebUI case)';
     document.getElementById('reason').textContent = d.reason || '-';
     document.getElementById('err').textContent = d.last_error || '';
+    if (directControl && d.active_prompt) {
+      document.getElementById('prompt-status').textContent = d.reason ? 'Claude plan: ' + d.reason : d.status;
+      const feedback = d.motion_feedback;
+      const details = feedback ? ['Current step: ' + feedback.latest_command + '.'] : [];
+      const delta = feedback?.previous_step?.measured_left_delta_xyz_mm;
+      if (delta) details.push('Measured left-arm ΔXYZ since prior step: ' + delta.map(value => value.toFixed(1)).join(', ') + ' mm.');
+      const depth = feedback?.cube_depth;
+      if (depth?.status === 'measured') details.push('Measured cube top in base_link: ' + depth.cube_top_center_m.join(', ') + ' m.');
+      document.getElementById('motion-feedback').textContent = details.join(' ');
+    }
     document.getElementById('inference-frames').hidden = !Object.values(d.images_b64 || {}).some(Boolean);
     for (const k of ['front','left_wrist','right_wrist']) {
       if (d.images_b64 && d.images_b64[k]) document.getElementById('img_' + k).src = 'data:image/jpeg;base64,' + d.images_b64[k];
@@ -1334,15 +1412,8 @@ function drawFeedOverlay(feed) {
       for (let r = 0; r < 3; r++) {
         for (let c = 0; c < 3; c++) {
           const code = vf.grid[r]?.[c] || '?';
+          if (code === '?') continue;
           const [px, py] = toPx(vf.cell_centers[r][c]);
-          if (code === '?') {
-            ctx.beginPath();
-            ctx.arc(px, py, dotR * 0.75, 0, Math.PI * 2);
-            ctx.strokeStyle = 'rgba(148, 163, 184, 0.55)';
-            ctx.lineWidth = 1;
-            ctx.stroke();
-            continue;
-          }
           ctx.beginPath();
           ctx.arc(px, py, dotR, 0, Math.PI * 2);
           ctx.fillStyle = CUBE_PALETTE[code] || CUBE_PALETTE['?'];
@@ -1391,7 +1462,7 @@ function render3DCube() {
   const faces = cubeState?.faces;
   const targetPreviewFace = cubeTargetFace.value === 'AUTO' ? 'F' : cubeTargetFace.value;
   const liveFaceMap = {};
-  if (live?.detected) {
+  if (live?.detected && !cubeAutoFillCheck.checked) {
     if (live.visible_faces && live.visible_faces.length >= 2) {
       for (const vf of live.visible_faces) {
         if (vf.face && vf.grid) liveFaceMap[vf.face] = vf.grid;
@@ -1803,8 +1874,9 @@ def start_console_http_server(
     release_manual: Callable[[], str] | None = None,
     prompts_enabled: bool = True,
     key_planner: ClaudeEndPosePlanner | None = None,
+    direct_control: DirectClaudeControl | None = None,
 ) -> http.server.ThreadingHTTPServer:
-    if any(item is not None for item in (live_jog, live_action, release_manual, key_planner)) and host != "127.0.0.1":
+    if any(item is not None for item in (live_jog, live_action, release_manual, key_planner, direct_control)) and host != "127.0.0.1":
         raise ValueError("Live SDK controls and cloud key entry require a localhost-only console")
     page = CONSOLE_HTML
     if live_jog is not None:
@@ -1818,7 +1890,9 @@ def start_console_http_server(
         page = page.replace('id="manual-release" hidden', 'id="manual-release"')
     if key_planner is not None:
         page = page.replace('id="key-form" class="row" hidden', 'id="key-form" class="row"')
-    if not prompts_enabled:
+    if direct_control is not None:
+        page = page.replace('data-direct="false"', 'data-direct="true"')
+    if not prompts_enabled and direct_control is None:
         page = page.replace('id="pform" class="row" data-enabled="true"', 'id="pform" class="row" data-enabled="false"')
     page_body = page.encode("utf-8")
 
@@ -1842,7 +1916,21 @@ def start_console_http_server(
                 or self.headers.get("Origin") != f"http://{origin_host}"
                 or self.headers.get_content_type() != "application/json"
             ):
+                self.discard_short_body()
                 raise PermissionError("This request must come from the local console.")
+
+        def discard_short_body(self) -> None:
+            # A socket closed with unread POST data can reset the error response.
+            length = self.headers.get("Content-Length", "")
+            if length.isascii() and length.isdecimal() and len(length) <= 4 and int(length) <= 8192:
+                timeout = self.connection.gettimeout()
+                self.connection.settimeout(0.25)
+                try:
+                    self.rfile.read(int(length))
+                except OSError:
+                    pass
+                finally:
+                    self.connection.settimeout(timeout)
 
         def _cube_snapshot(self) -> dict[str, Any]:
             snap = prompt_ctrl.cube_state.snapshot()
@@ -1873,6 +1961,23 @@ def start_console_http_server(
             self.wfile.write(page_body)
 
         def do_POST(self) -> None:
+            if self.path in ("/api/direct/stop", "/api/direct/heartbeat") and direct_control is not None:
+                try:
+                    self.require_local_json()
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 <= length <= 16:
+                        raise ValueError("Invalid direct control request.")
+                    self.rfile.read(length)
+                    if self.path == "/api/direct/stop":
+                        direct_control.stop()
+                    else:
+                        direct_control.heartbeat()
+                    self.reply_json(200, {"ok": True})
+                except PermissionError as exc:
+                    self.reply_json(403, {"error": str(exc)})
+                except ValueError as exc:
+                    self.reply_json(400, {"error": str(exc)})
+                return
             if self.path in ("/api/anthropic-key", "/api/manual/release"):
                 try:
                     self.require_local_json()
@@ -2036,7 +2141,27 @@ def start_console_http_server(
                     self.reply_json(502, {"error": f"{type(exc).__name__}: {exc}"})
                 return
             if self.path == "/api/prompt":
+                if direct_control is not None:
+                    try:
+                        self.require_local_json()
+                        length = int(self.headers.get("Content-Length", "0"))
+                        if not 0 < length <= 8192:
+                            raise ValueError("Invalid direct prompt request.")
+                        payload = json.loads(self.rfile.read(length))
+                        use_cube_depth = payload.get("use_cube_depth", True)
+                        if not isinstance(use_cube_depth, bool):
+                            raise ValueError("The cube-depth option must be true or false.")
+                        direct_control.start(payload["prompt"], use_cube_depth=use_cube_depth)
+                        self.reply_json(200, {"ok": True})
+                    except PermissionError as exc:
+                        self.reply_json(403, {"error": str(exc)})
+                    except (ValueError, KeyError, TypeError) as exc:
+                        self.reply_json(400, {"error": str(exc)})
+                    except RuntimeError as exc:
+                        self.reply_json(409, {"error": str(exc)})
+                    return
                 if not prompts_enabled:
+                    self.discard_short_body()
                     self.reply_json(409, {"error": "Zero-shot prompts require the Claude policy console."})
                     return
                 if key_planner is not None:
@@ -2046,6 +2171,7 @@ def start_console_http_server(
                         self.reply_json(403, {"error": str(exc)})
                         return
                     if not key_planner.api_key:
+                        self.discard_short_body()
                         self.reply_json(409, {"error": "Verify the Anthropic key before arming a prompt."})
                         return
                 ln = int(self.headers.get("Content-Length", "0"))

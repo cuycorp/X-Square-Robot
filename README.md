@@ -46,6 +46,21 @@ Open `http://127.0.0.1:8004/`, verify an Anthropic API key, and enter a prompt. 
 
 Workspace and step limits bound the generated trajectories. Collision and reachability checks depend on the downstream robot controller and its configuration. Claude mode sends inference camera observations to the configured Anthropic API endpoint.
 
+### Direct Claude control over the local SDK
+
+On the wired Desktop G station, start the SDK console from the laptop's Linux environment with the SDK installed and a matching station URDF:
+
+```bash
+python harness/jog_console.py --port 8003 --sdk-address 192.168.77.2:50051 \
+  --urdf STATION.urdf --direct-rosbridge ws://192.168.77.2:9090/
+```
+
+Use this console as the station's only motion client. Open `http://127.0.0.1:8003/`, verify the Anthropic key, then click **Run Zero-Shot Prompt**. The server reads the three cameras from rosbridge and both arm poses from SDK joint feedback and the station URDF. It sends the images and poses to Anthropic for planning, then sends bounded left-arm and gripper targets to the robot over the local SDK. This mode runs independently of the robot WebUI and task list.
+
+Manual motion is locked while a direct run is active. **Stop Claude Control** cancels further targets. A target already sent to the controller can still finish. Each pose increment is capped at 5 mm and 1 degree, and each run is capped at 150 seconds. An unclear plan, failed IK, or lost feedback stops the run. The station operator remains responsible for checking clearance and using the physical stop if needed.
+
+For cube prompts, **Use depth for cube position** adds the locally measured top-face center and nearby tabletop height in `base_link`. Depth is registered to the front RGB image using timestamped frames, CameraInfo, and static transforms. RGB images and measured coordinates reach Claude, while the depth image stays on the local network. Clear the checkbox to use RGB alone. The status line shows SDK command acceptance and displacement from the next measured observation separately from Claude's plan.
+
 ## Joint angles and kinematics
 
 Connecting to rosbridge also displays the measured angles for six joints on each arm. **Advanced IK** opens the pose preview, which uses the robot model from `/robot_description` and joint angles from `/joint_states`. Choose an arm and click **Use Current Pose** to start from its measured gripper-base pose, or enter a target in `base_link`. **Calculate IK** displays a joint solution and its pose residual when the solver converges.
