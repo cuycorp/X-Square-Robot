@@ -17,7 +17,7 @@ No other models, no cloud GPU, no Nebius.
                                     ▼
  Robot 192.168.77.2          Laptop 192.168.77.18                        Wall-X
  ┌──────────────────┐  WS   ┌──────────────────────────────┐   WS     ┌───────────────────────┐
- │ organizer client │──────▶│ harness.py :8001             │─────────▶│ on-site ws://HOST:33677│
+ │ organizer client │──────▶│ harness.py :8001             │─────────▶│ cloud (no on-site one) │
  │ public_v2, sync  │◀──────│  • instruction ← your text   │◀─────────│  or cloud wss://maas-  │
  │ executes poses   │ 32 fr │  • taps images + state → GUI │          │  api.x2robot.com/…     │
  └──────────────────┘       │  • timing per hop            │          └───────────────────────┘
@@ -58,11 +58,26 @@ Facts from the docs:
 
 ## Phase 1 — Ask the organizers (5 min, saves hours)
 
-- [ ] Which Wall-X address should we use: the **on-site `ws://HOST:33677`** (low latency, preferred) or the cloud `wss://maas-api.x2robot.com/v1/vla/wallx`?
-- [ ] The auth header format for the on-site address (the cloud one already works with `Bearer`).
-- [ ] Confirm our gripper is **G** (`quanta_x1_pro/gripper-g`) and not H.
+Laptop-side checks (2026-11-21):
+- WebUI `http://192.168.77.2/` → HTTP 200 (16 ms); robot SSH port 22 open.
+- Laptop **ufw is active**, so the Phase 3 rule for port 8001 is required.
+- Cloud Wall-X: connect + handshake ~1.3 s; **WebSocket RTT median ~290 ms (213–1423 ms)** before
+  uploading 3 JPEGs or any inference. That adds ~0.3 s to every ~1.1 s chunk.
+
+- [x] Which Wall-X address? **There is no on-site endpoint.** Use the cloud
+      `wss://maas-api.x2robot.com/v1/vla/wallx` (auth `Bearer`, already verified). The ~290 ms network RTT is fixed,
+      so reduce latency elsewhere: one persistent connection per run, and keep the harness hop on wired Ethernet.
+- [x] Auth for the on-site address: not applicable.
+- [ ] Confirm our gripper is **G** (`quanta_x1_pro/gripper-g`) and not H. Fallback: check in Phase 2 that the
+      gripper reading stays ≤ 1.526 when fully open.
 
 ## Phase 2 — Configure Wall-X directly in the WebUI (no code)
+
+> **Blocker (2026-11-21):** `http://192.168.77.2/robot/task-manage` shows "X2Robot Operator Login" (PD cloud
+> account). This WebUI build has **no "Local Environment"** option: the environment dropdown offers only
+> 正式/开发/测试/自定义 (production/dev/test/custom). Ask the organizers for an operator account or the local-mode
+> procedure. Discovered on the robot: **rosbridge (Tornado) on `:9090`** (useful read-only for the Phase 5
+> dashboard) and a Python `websockets` server on `:8888`.
 
 This proves the robot, the model and the auth work before we add anything.
 
@@ -88,6 +103,58 @@ This proves the robot, the model and the auth work before we add anything.
 If something fails: `unknown_embodiment` → wrong gripper suffix or capitalisation. `401/403` → auth.
 Old address still used → a WebUI override in `/home/xr/diversity/local/state/model_overrides.json`
 (Restore Default may wipe the key).
+
+## Phase 2b — "What does the camera see" with Nebius (read-only, no login needed)
+
+Runs alongside the Phase 2 blocker: rosbridge `:9090` serves the cameras with no WebUI login.
+
+- [x] `perception/camera.py`: one JPEG per camera via rosbridge (head 1280×720, wrist 640×480; < 70 ms).
+- [x] `perception/nebius_vision.py`: OpenAI-compatible call to `https://api.tokenfactory.nebius.com/v1`.
+- [x] `perception/see.py` CLI + 10 offline tests (`.venv/bin/python -m unittest -v perception/test_perception.py`).
+- [x] User: create a Token Factory API key → `python3 perception/set_nebius_key.py`.
+- [x] Model chosen by side-by-side test: **`Qwen/Qwen3.8-27B`, thinking off (~1.2 s)**; runner-up
+      `nvidia/Nemotron-3.5-Super-VL` (~1.8 s). The reasoning models return empty text if `max_tokens` is
+      spent on thinking. Gemma-3 reads images at low resolution; Kimi ignores the thinking switch.
+- [x] First live run on the head camera: objects listed correctly, and pen-vs-book position verified against the saved frame.
+- [ ] **User:** write `prompts.scene_json_prompt()` (the scene schema), then `see.py --json`.
+- [ ] Confirm which arm `cam1` / `cam3` belong to (move one arm, watch which image changes).
+- [x] Browser UI `perception/webui.py` (`http://127.0.0.1:8080`): live camera (Head / Wrist 1 / Wrist 3), question
+      box, answer box, "model saw" thumbnails, history. 9 more offline tests (21 total). Verified live in a headless browser.
+- [ ] Later: merge into the Phase 5 dashboard (arm readings via rosbridge `/left_arm/end_pose`, `/joint_states`).
+
+## Phase 2c — Natural-language movement with our own safety checks (DRY-RUN)
+
+- [x] `motion/kinematics.py`: FK/IK from the robot's URDF; matches `/{side}_arm/end_pose` exactly.
+- [x] `motion/safety.py`: step ≤ 3 cm / 15°, IK reachable, joint limits (5° margin, "don't make worse"),
+      joint change ≤ 34°, workspace box, reach, table clearance + arm separation checked at 6 points along the path,
+      gripper range, contact-force monitor. Limits in `motion/safety_config.json`.
+- [x] `motion/command_parser.py`: Nebius turns a command into JSON moves, or asks a clarifying question.
+- [x] UI: live Arms panel (joints with limit bars, fingertip, gripper, force change) + Move panel (interpretation,
+      every check ✓/✗, message preview). The send button is locked. 42 offline tests in total.
+- [x] Pick planning (dry-run): "pick the cube in front of you" → vision-model box → depth → 3D (Rubik's cube
+      measured 5.6–5.7 cm tall, true 5.7) → 23-step plan (right arm, 60° tilt; straight-down grips hit joint4's
+      limit). Overlay shows the box and planned fingertip path. 53 offline tests.
+- [x] Head-camera position corrected by +7.3 cm from the robot's hand-eye calibration; projected fingertips
+      verified on the image.
+- [ ] **User:** confirm the table height. Depth measures it at z ≈ −1 cm, so `table_z: 0.0` is about right but
+      unconfirmed. Confirm the gripper direction (is 1.526 open?) and that a 5.7 cm cube fits the open gripper;
+      then set the `*_verified` flags in `safety_config.json`.
+- [x] Read-only command recorder `motion/record_commands.py` (+ tests). Fixed the UI starving rosbridge
+      (camera stream now 4 fps and on demand; joint states back to 10–16 Hz).
+- [ ] **Record the platform's own commands** while someone moves the arm (leader arm / teleop / Wall-X run):
+      `.venv/bin/python motion/record_commands.py --seconds 15`. Need the verdict "CONFIRMED" for each arm.
+- [x] Live sender built (`motion/sender.py`, UI Execute/Stop, `--live` flag); locked until the convention is verified.
+      63 offline tests (sender tested against a fake socket).
+- [x] **`pose_cmd_convention` verified from the robot's own recordings:** `relative_to_neutral`, empty frame_id
+      (12 moving arm sessions: 1–4 mm vs 215–218 mm). Static recordings are reported as inconclusive. 66 tests.
+- [x] First attempt via raw pose_cmd: the arm didn't move (platform in base mode ignores external commands).
+- [x] Official SDK v1.1.2 (gRPC :50051) connected; sender now uses `set_joint_positions` in SDK mode; UI has
+      Enter/Exit SDK mode + Robot E-stop. 70 offline tests; bridge verified read-only on the robot.
+- [ ] First live test via SDK (on our turn, teammates clear): "left arm up 1 cm", hand on the E-stop.
+- [ ] When done: **Exit SDK mode** (shared robot).
+- [ ] First live test (only after both of the above): left arm +1 cm in z, hand on the E-stop; expect
+      `end_pose` z +1.0 cm and nothing else.
+- [ ] Only after approval: add a sender (one move at a time, confirm click, live joint/contact monitor → `/safety_controller/halt`).
 
 ## Phase 3 — Put the harness in the middle (passthrough)
 

@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Eyes</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%232f6fed'/%3E%3Ccircle cx='8' cy='8' r='2.5' fill='white'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --ink: #1c1f24; --muted: #667085; --line: #e3e6eb;
+    --accent: #2f6fed; --accent-ink: #ffffff; --ok: #1f9d55; --bad: #d64545; --warn: #b7791f;
+    --answer: #f7f9fc; --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111316; --panel: #1a1d22; --ink: #e8eaed; --muted: #9aa3af; --line: #2a2f36;
+      --accent: #5b8cff; --accent-ink: #0b0d10; --answer: #15181c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px;
+           border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted);
+          border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  .spacer { flex: 1; }
+  main { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr); gap: 16px;
+         padding: 16px 20px; max-width: 1500px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+  main > .stack:first-child { align-self: start; }
+  .banner { border: 1px solid var(--warn); color: var(--warn); border-radius: 8px; padding: 8px 10px;
+            font-size: 13.5px; margin-bottom: 10px; }
+  .arms { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 560px) { .arms { grid-template-columns: 1fr; } }
+  .arm h3 { margin: 0 0 6px; font-size: 14px; }
+  .kv { font-size: 13px; color: var(--muted); margin: 2px 0; }
+  .kv b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .joint { display: grid; grid-template-columns: 52px 1fr 58px; align-items: center; gap: 6px; font-size: 12.5px;
+           font-variant-numeric: tabular-nums; margin: 3px 0; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; position: relative; overflow: hidden; }
+  .bar i { position: absolute; top: 0; bottom: 0; left: 0; background: var(--ok); border-radius: 3px; }
+  .bar i.near { background: var(--bad); }
+  .checks { list-style: none; padding: 0; margin: 8px 0 0; font-size: 13.5px; }
+  .checks li { display: grid; grid-template-columns: 20px 1fr; gap: 4px; padding: 3px 0; border-top: 1px solid var(--line); }
+  .checks .pass { color: var(--ok); } .checks .fail { color: var(--bad); }
+  .checks small { color: var(--muted); display: block; }
+  .verdict { font-weight: 700; margin-top: 6px; }
+  .verdict.ok { color: var(--ok); } .verdict.blocked { color: var(--bad); }
+  details { margin-top: 8px; font-size: 13px; }
+  details pre { background: var(--answer); border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+                overflow: auto; max-height: 220px; font-size: 12px; }
+  button.locked { margin-top: 10px; width: 100%; background: transparent; color: var(--muted); border: 1px dashed var(--line);
+                  border-radius: 8px; padding: 9px; font: inherit; cursor: not-allowed; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+  .tab { border: 1px solid var(--line); background: transparent; color: var(--ink); border-radius: 8px;
+         padding: 6px 12px; cursor: pointer; font: inherit; font-size: 14px; }
+  .tab[aria-selected="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .view { position: relative; background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 16 / 9; }
+  .view img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .view .overlay { position: absolute; inset: 0; display: grid; place-items: center; color: #ccd;
+                   font-size: 14px; text-align: center; padding: 20px; }
+  .note { font-size: 13px; color: var(--muted); margin-top: 8px; }
+  .note.warn { color: var(--warn); }
+  .stack { display: flex; flex-direction: column; gap: 16px; }
+  label.block { display: block; font-weight: 600; margin-bottom: 6px; }
+  textarea { width: 100%; min-height: 84px; resize: vertical; border: 1px solid var(--line); border-radius: 8px;
+             padding: 10px 12px; font: inherit; background: var(--bg); color: var(--ink); }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+  .chip { border: 1px dashed var(--line); background: transparent; color: var(--muted); border-radius: 999px;
+          padding: 3px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+  .chip:hover { color: var(--ink); border-color: var(--muted); }
+  .row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 8px; font-size: 14px; }
+  .row label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+  button.primary { margin-left: auto; background: var(--accent); color: var(--accent-ink); border: 0;
+                   border-radius: 8px; padding: 9px 18px; font: inherit; font-weight: 600; cursor: pointer; }
+  button.primary:disabled { opacity: .55; cursor: progress; }
+  .answer { min-height: 120px; white-space: pre-wrap; background: var(--answer); border: 1px solid var(--line);
+            border-radius: 8px; padding: 12px; }
+  .answer.empty { color: var(--muted); }
+  .answer.error { color: var(--bad); }
+  .meta { font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+  .saw { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .saw figure { margin: 0; }
+  .saw img { height: 72px; border-radius: 6px; border: 1px solid var(--line); display: block; }
+  .saw figcaption { font-size: 11.5px; color: var(--muted); }
+  .history { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px;
+             max-height: 260px; overflow: auto; }
+  .history li { border-top: 1px solid var(--line); padding-top: 8px; font-size: 14px; }
+  .history .q { font-weight: 600; }
+  .history .a { color: var(--muted); white-space: pre-wrap; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--line);
+             border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite;
+             vertical-align: -2px; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Robot Eyes</h1>
+  <span class="pill"><span id="dot" class="dot"></span><span id="status">connecting…</span></span>
+  <span class="spacer"></span>
+  <span class="pill" id="model">model: …</span>
+</header>
+
+<main>
+  <div class="stack">
+  <section>
+    <h2>Camera</h2>
+    <div class="tabs" role="tablist" id="tabs"></div>
+    <div class="view">
+      <img id="stream" alt="Live robot camera">
+      <div class="overlay" id="overlay">Waiting for camera…</div>
+    </div>
+    <div class="note" id="camNote"></div>
+  </section>
+
+  <section>
+    <h2>Arms <span class="kv" id="armsNote"></span></h2>
+    <div class="arms" id="arms"><div class="kv">Waiting for arm readings…</div></div>
+    <div class="note warn" id="contact"></div>
+    <div class="row"><button class="chip" id="resetForce" title="Use the current force reading as 'no contact'">Reset force baseline</button></div>
+  </section>
+  </div>
+
+  <div class="stack">
+    <section>
+      <label class="block" for="question">Question</label>
+      <textarea id="question" placeholder="What is on the table?   (Enter to ask, Shift+Enter for a new line)"></textarea>
+      <div class="chips" id="chips"></div>
+      <div class="row">
+        <span>Send:</span>
+        <span id="sendBoxes"></span>
+        <label title="Slower (~4–5 s), better for hard questions"><input type="checkbox" id="think"> Think</label>
+        <button class="primary" id="ask">Ask</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Answer</h2>
+      <div class="answer empty" id="answer" aria-live="polite">Ask a question about what the robot sees.</div>
+      <div class="meta" id="meta"></div>
+      <div class="saw" id="saw"></div>
+    </section>
+
+    <section>
+      <h2>Move</h2>
+      <div class="banner" id="liveBanner">Checking live-control status…</div>
+      <div class="row" id="modeRow" style="margin-bottom:8px">
+        <span class="kv">Robot mode: <b id="robotMode">…</b></span>
+        <button class="chip" id="sdkOn">Enter SDK mode</button>
+        <button class="chip" id="sdkOff">Exit SDK mode</button>
+        <span class="spacer"></span>
+        <button class="primary" id="robotEstop" style="background:var(--bad)" title="SDK emergency stop">Robot E-stop</button>
+        <button class="chip" id="recoverEstop">Recover</button>
+      </div>
+      <div class="kv">Directions are from the robot's point of view (its left / right / forward / up).</div>
+      <div id="execBox" style="display:none" class="banner">
+        <div id="execMsg"></div>
+        <button class="primary" id="stopBtn" style="background:var(--bad);margin-top:8px;width:100%">STOP (hold pose)</button>
+        <div class="kv">Stop holds the arm where it is. In an emergency press the red E-stop on the robot.</div>
+      </div>
+      <label class="block" for="moveCmd">Movement command</label>
+      <textarea id="moveCmd" placeholder="e.g. left arm up 2 cm · right arm forward 3 cm and open the gripper · pick the cube in front of you"></textarea>
+      <div class="row"><span class="spacer"></span><button class="primary" id="plan">Plan move</button></div>
+      <div id="planOut"></div>
+    </section>
+
+    <section>
+      <h2>History</h2>
+      <ul class="history" id="history"><li class="a">Nothing asked yet.</li></ul>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const WRIST_NOTE = "Wrist cameras are wide-angle and may show people nearby. They are only sent to Nebius if ticked under Send.";
+const QUICK = ["What is on the table?", "Where is the pen?", "Which objects could a gripper pick up?", "Is anything blocking the arms?"];
+let cameras = {}, current = "head", history = [];
+
+function selectCamera(name) {
+  current = name;
+  document.querySelectorAll(".tab").forEach(t => t.setAttribute("aria-selected", t.dataset.cam === name));
+  $("overlay").style.display = "grid";
+  $("overlay").textContent = "Waiting for camera…";
+  $("stream").src = "/stream/" + name + "?t=" + Date.now();
+  $("camNote").textContent = name === "head" ? cameras[name] : WRIST_NOTE;
+  $("camNote").className = "note" + (name === "head" ? "" : " warn");
+}
+
+function buildControls() {
+  $("tabs").innerHTML = "";
+  $("sendBoxes").innerHTML = "";
+  for (const name of Object.keys(cameras)) {
+    const tab = document.createElement("button");
+    tab.className = "tab"; tab.role = "tab"; tab.dataset.cam = name;
+    tab.textContent = name === "head" ? "Head" : name.replace("cam", "Wrist ");
+    tab.onclick = () => selectCamera(name);
+    $("tabs").append(tab);
+    const lbl = document.createElement("label");
+    lbl.innerHTML = `<input type="checkbox" value="${name}" ${name === "head" ? "checked" : ""}> ${tab.textContent}`;
+    $("sendBoxes").append(lbl, " ");
+  }
+  for (const q of QUICK) {
+    const c = document.createElement("button");
+    c.className = "chip"; c.textContent = q;
+    c.onclick = () => { $("question").value = q; ask(); };
+    $("chips").append(c);
+  }
+  selectCamera(current);
+}
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch("/status")).json();
+    if (!Object.keys(cameras).length) { cameras = s.cameras; buildControls(); }
+    $("model").textContent = "model: " + s.model;
+    const age = s.frame_age_s[current];
+    const live = s.connected && age !== undefined && age < 3;
+    $("dot").className = "dot " + (live ? "ok" : "bad");
+    $("status").textContent = !s.connected ? ("robot offline" + (s.error ? " — " + s.error : ""))
+      : age === undefined ? "connected, waiting for frames" : live ? "live" : `stale frame (${age.toFixed(1)} s)`;
+  } catch { $("dot").className = "dot bad"; $("status").textContent = "UI server not reachable"; }
+}
+
+$("stream").onload = () => { $("overlay").style.display = "none"; };
+$("stream").onerror = () => { $("overlay").style.display = "grid"; $("overlay").textContent = "Camera stream lost. Retrying…";
+                              setTimeout(() => selectCamera(current), 2000); };
+
+async function ask() {
+  const question = $("question").value.trim();
+  if (!question) { $("question").focus(); return; }
+  const sendCams = [...$("sendBoxes").querySelectorAll("input:checked")].map(i => i.value);
+  if (!sendCams.length) { setAnswer("Tick at least one camera under Send.", "error"); return; }
+  $("ask").disabled = true;
+  $("answer").className = "answer"; $("answer").innerHTML = '<span class="spinner"></span>Looking…';
+  $("meta").textContent = ""; $("saw").innerHTML = "";
+  const started = performance.now();
+  try {
+    const r = await fetch("/ask", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, cameras: sendCams, think: $("think").checked }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+    setAnswer(d.answer);
+    const total = Math.round(performance.now() - started);
+    const u = d.usage || {};
+    $("meta").textContent = `${d.model} · model ${d.model_ms} ms · total ${total} ms · tokens ${u.prompt_tokens ?? "?"} in / ${u.completion_tokens ?? "?"} out`;
+    for (const [name, b64] of Object.entries(d.frames)) {
+      const fig = document.createElement("figure");
+      fig.innerHTML = `<img src="data:image/jpeg;base64,${b64}" alt="Frame sent from ${name}"><figcaption>model saw: ${name}</figcaption>`;
+      $("saw").append(fig);
+    }
+    addHistory(question, d.answer);
+  } catch (e) {
+    setAnswer(e.message, "error");
+  } finally {
+    $("ask").disabled = false;
+  }
+}
+
+function setAnswer(text, kind = "") { $("answer").className = "answer " + kind; $("answer").textContent = text; }
+
+function addHistory(q, a) {
+  history.unshift({ q, a });
+  history = history.slice(0, 20);
+  $("history").innerHTML = "";
+  for (const h of history) {
+    const li = document.createElement("li");
+    li.innerHTML = '<div class="q"></div><div class="a"></div>';
+    li.querySelector(".q").textContent = h.q;
+    li.querySelector(".a").textContent = h.a;
+    $("history").append(li);
+  }
+}
+
+// ---------- arms (live, read-only) ----------
+function esc(s) { const d = document.createElement("div"); d.textContent = String(s); return d.innerHTML; }
+
+async function refreshArms() {
+  try {
+    const r = await fetch("/arm_state");
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
+    const margin = d.joint_margin_deg;
+    $("armsNote").textContent = d.table_z_verified ? "" : "· table height not calibrated";
+    $("arms").innerHTML = ["left", "right"].map(side => {
+      const a = d.arms[side];
+      const joints = a.joints.map(j => {
+        const pct = Math.max(2, Math.min(100, (j.margin_deg / 90) * 100));
+        return `<div class="joint"><span>${esc(j.name)}</span><span class="bar"><i class="${j.margin_deg < margin ? "near" : ""}" style="width:${pct}%"></i></span><span>${j.deg.toFixed(1)}°</span></div>`;
+      }).join("");
+      return `<div class="arm"><h3>${side === "left" ? "Left" : "Right"} arm</h3>
+        <div class="kv">fingertip <b>${a.fingertip_cm.map(v => v.toFixed(1)).join(", ")}</b> cm</div>
+        <div class="kv">gripper <b>${a.gripper.toFixed(3)}</b> · force change <b>${a.force_change_n ?? "–"}</b> N</div>
+        ${joints}<div class="kv">bar = distance to nearest joint limit (red &lt; ${margin}°)</div></div>`;
+    }).join("");
+    $("contact").textContent = d.contact_alerts.length ? "⚠ " + d.contact_alerts.join(" · ") : "";
+  } catch (e) {
+    $("arms").innerHTML = `<div class="kv">Arm readings unavailable: ${esc(e.message)}</div>`;
+  }
+}
+$("resetForce").onclick = async () => { await fetch("/reset_force_baseline", { method: "POST" }); refreshArms(); };
+
+// ---------- move planning (dry-run) ----------
+async function planMove() {
+  const command = $("moveCmd").value.trim();
+  if (!command) { $("moveCmd").focus(); return; }
+  $("plan").disabled = true;
+  $("planOut").innerHTML = '<p><span class="spinner"></span>Planning and checking…</p>';
+  try {
+    const r = await fetch("/plan_move", { method: "POST", headers: { "Content-Type": "application/json" },
+                                          body: JSON.stringify({ command }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
+    $("planOut").innerHTML = renderPlan(d);
+  } catch (e) {
+    $("planOut").innerHTML = `<p class="answer error">${esc(e.message)}</p>`;
+  } finally { $("plan").disabled = false; }
+}
+
+function renderPick(d) {
+  const p = d.pick, o = p.object_cm;
+  const img = d.overlay ? `<img src="data:image/jpeg;base64,${d.overlay}" alt="Planned pick" style="width:100%;border-radius:8px;margin-top:8px">` : "";
+  if (!o) return `<p class="answer">${esc(d.clarification || "Could not locate the object.")}</p>${img}`;
+  const phases = Object.entries(p.phases || {}).map(([name, ph]) =>
+    `<li><span class="${ph.ok ? "pass" : "fail"}">${ph.ok ? "✓" : "✗"}</span><span>${esc(name)}<small>${ph.steps} step${ph.steps > 1 ? "s" : ""}, each fully safety-checked</small></span></li>`).join("");
+  const attempts = (p.attempts || []).map(a =>
+    `<li><span class="${a.ok ? "pass" : "fail"}">${a.ok ? "✓" : "✗"}</span><span>${esc(a.arm)} arm, ${esc(a.orientation)}<small>${a.ok ? "all steps pass" :
+      `stopped at "${esc(a.failure?.phase)}": ${esc((a.failure?.failed || []).join("; "))}`}</small></span></li>`).join("");
+  const corr = p.camera_correction;
+  return `<p>${esc(d.explanation)}</p>
+    <div class="kv">object <b>${esc(p.object)}</b> at x <b>${o.x}</b>, y <b>${o.y}</b> cm · height <b>${o.height}</b> cm · footprint <b>${o.size_xy.join(" × ")}</b> cm · table at <b>${o.table_z}</b> cm</div>
+    <div class="verdict ${d.ok ? "ok" : "blocked"}">${d.ok ? `Pick plan passes every check (${esc(p.arm)} arm, ${esc(p.orientation)})` : "No safe pick plan found"}</div>
+    ${img}
+    <div class="kv">yellow box = what the vision model found · magenta = 3D top centre · green dots = planned fingertip path (red = failed step)</div>
+    <h2 style="margin-top:12px">Phases</h2><ul class="checks">${phases}</ul>
+    <details><summary>Arms and grasp angles tried (${(p.attempts || []).length})</summary><ul class="checks">${attempts}</ul></details>
+    <details><summary>First movement message that would be sent (format not yet verified)</summary><pre>${esc(JSON.stringify(p.first_messages, null, 2))}</pre></details>
+    <div class="meta">${esc(d.model)} · interpret ${d.model_ms} ms · locate ${d.locate_ms} ms · plan ${d.plan_ms ?? "–"} ms · camera ${corr.applied ? `corrected by ${corr.shift.map(v => (100 * v).toFixed(1)).join(", ")} cm (${esc(corr.reason)})` : `uncorrected: ${esc(corr.reason)}`}</div>
+    ${liveControls(d)}`;
+}
+
+function renderPlan(d) {
+  if (d.pick) return renderPick(d);
+  if (d.clarification && !d.moves.length) return `<p class="answer">The model needs more detail: ${esc(d.clarification)}</p>`;
+  const moves = d.moves.map(m => {
+    const t = m.translate_cm, r = m.rotate_deg;
+    const parts = [];
+    if (t.x || t.y || t.z) parts.push(`move x ${t.x} / y ${t.y} / z ${t.z} cm`);
+    if (r.roll || r.pitch || r.yaw) parts.push(`rotate roll ${r.roll} / pitch ${r.pitch} / yaw ${r.yaw}°`);
+    if (m.gripper) parts.push(`${m.gripper} gripper`);
+    return `<li><b>${esc(m.arm)} arm:</b> ${esc(parts.join(", "))}</li>`;
+  }).join("");
+  const checks = d.checks.map(c => `<li><span class="${c.ok ? "pass" : "fail"}">${c.ok ? "✓" : "✗"}</span>
+      <span>${esc(c.name)}${c.arm ? ` (${esc(c.arm)})` : ""}<small>${esc(c.detail)}</small></span></li>`).join("");
+  const preview = Object.entries(d.targets).map(([s, t]) =>
+      `${s} arm joint changes (°): ${t.joint_change_deg.join(", ")}\n` + JSON.stringify(t.ros_preview, null, 2)).join("\n\n");
+  return `<p>${esc(d.explanation)}</p><ul>${moves}</ul>
+    <div class="verdict ${d.ok ? "ok" : "blocked"}">${d.ok ? "All safety checks passed" : "Blocked by safety checks"}</div>
+    <ul class="checks">${checks}</ul>
+    <div class="meta">${esc(d.model)} · interpret ${d.model_ms} ms · checks ${d.plan_ms ?? "–"} ms</div>
+    ${preview ? `<details><summary>Messages that would be sent (format not yet verified)</summary><pre>${esc(preview)}</pre></details>` : ""}
+    ${liveControls(d)}`;
+}
+
+// ---------- live execution ----------
+let lastPlan = null;
+function liveControls(d) {
+  lastPlan = d;
+  const live = d.live;
+  if (!d.ok) return `<button class="locked" disabled>Not executable: the plan failed its safety checks</button>`;
+  if (!live) return `<button class="locked" disabled>Not executable</button>`;
+  if (!live.executable) return `<button class="locked" disabled>Send to robot: locked (${esc(live.why_not)})</button>`;
+  return `<button class="primary" id="execBtn" style="margin-top:10px;width:100%;background:var(--bad)">Execute on robot (${live.steps} step${live.steps > 1 ? "s" : ""})</button>`;
+}
+
+document.addEventListener("click", async (e) => {
+  if (e.target.id !== "execBtn" || !lastPlan?.live?.plan_id) return;
+  const what = lastPlan.pick ? `pick ${lastPlan.pick.object} with the ${lastPlan.pick.arm} arm` : lastPlan.explanation;
+  if (!confirm(`The robot will MOVE:\n\n${what}\n(${lastPlan.live.steps} checked steps)\n\nWorkspace clear and hand on the E-stop?`)) return;
+  try {
+    const r = await fetch("/execute", { method: "POST", headers: { "Content-Type": "application/json" },
+                                        body: JSON.stringify({ plan_id: lastPlan.live.plan_id, confirmed: true }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
+    e.target.disabled = true;
+    pollExec();
+  } catch (err) { alert("Not started: " + err.message); }
+});
+
+$("stopBtn").onclick = async () => { await fetch("/stop", { method: "POST" }); pollExec(); };
+
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
+  return d;
+}
+async function refreshMode() {
+  try { const m = await (await fetch("/robot_mode")).json(); $("robotMode").textContent = m.name || "unknown"; }
+  catch { $("robotMode").textContent = "unknown"; }
+}
+async function setSdk(on) {
+  const q = on ? "Switch the robot into SDK mode?\n\nThe robot is SHARED: make sure your teammates are clear of the arms and not using it."
+               : "Switch the robot back to its normal mode?\n\nKeep a hand near the red E-stop.";
+  if (!confirm(q)) return;
+  try { await post("/sdk_mode", { on, confirmed: true }); } catch (e) { alert("Mode change failed: " + e.message); }
+  refreshMode();
+}
+$("sdkOn").onclick = () => setSdk(true);
+$("sdkOff").onclick = () => setSdk(false);
+$("robotEstop").onclick = async () => {
+  try { await post("/robot_estop", {}); alert("Robot E-stop sent. Use Recover when it is safe."); }
+  catch (e) { alert("E-stop via SDK failed (" + e.message + "). PRESS THE RED E-STOP ON THE ROBOT."); }
+  pollExec();
+};
+$("recoverEstop").onclick = async () => {
+  if (!confirm("Recover from the robot E-stop? The workspace must be clear.")) return;
+  try { await post("/robot_estop", { recover: true }); } catch (e) { alert("Recover failed: " + e.message); }
+};
+refreshMode();
+setInterval(refreshMode, 4000);
+
+let execTimer = null;
+async function pollExec() {
+  try {
+    const s = await (await fetch("/exec_status")).json();
+    const live = !s.blockers.length;
+    $("liveBanner").innerHTML = live
+      ? `<b>LIVE: executed plans move the robot</b> (via ${s.backend === "sdk" ? "the official SDK, robot must be in SDK mode" : "pose_cmd, " + esc(s.convention)}). Every plan is safety-checked and needs your confirmation.`
+      : `DRY-RUN: moves are planned and safety-checked, but <b>nothing is sent to the robot</b> (${esc(s.blockers.join("; "))}).`;
+    const running = s.state === "running";
+    $("execBox").style.display = (running || s.state === "stopped" || s.state === "done") ? "block" : "none";
+    $("stopBtn").style.display = running ? "block" : "none";
+    $("execMsg").innerHTML = `<b>${esc(s.state.toUpperCase())}</b> · step ${s.step}/${s.total} · ${esc(s.message)}`;
+    clearTimeout(execTimer);
+    execTimer = setTimeout(pollExec, running ? 300 : 3000);
+  } catch { clearTimeout(execTimer); execTimer = setTimeout(pollExec, 3000); }
+}
+pollExec();
+
+$("plan").onclick = planMove;
+$("moveCmd").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); planMove(); } });
+refreshArms();
+setInterval(refreshArms, 1000);
+
+$("ask").onclick = ask;
+$("question").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } });
+refreshStatus();
+setInterval(refreshStatus, 2000);
+</script>
+</body>
+</html>

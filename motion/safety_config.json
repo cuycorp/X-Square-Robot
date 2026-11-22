@@ -1,0 +1,46 @@
+{
+  "_comment": "Safety limits for planned arm moves. Positions in metres in base_link (x forward, y robot-left, z up). Review these before any live motion.",
+
+  "max_step_m": 0.03,
+  "max_rotation_deg": 15,
+  "max_joint_change_rad": 0.6,
+  "joint_margin_deg": 5,
+  "ik_position_tolerance_m": 0.002,
+  "ik_rotation_tolerance_deg": 1.0,
+
+  "table_z": 0.0,
+  "table_z_verified": false,
+  "table_clearance_m": 0.03,
+  "workspace_x": [0.35, 1.15],
+  "workspace_y": [-0.75, 0.75],
+  "workspace_z_max": 0.65,
+  "max_reach_m": 0.6,
+
+  "min_arm_distance_m": 0.10,
+  "path_samples": 6,
+
+  "gripper_range": [0.0, 1.526],
+  "gripper_open": 1.526,
+  "gripper_closed": 0.0,
+  "gripper_direction_verified": false,
+
+  "contact_force_delta_n": 15.0,
+
+  "live": {
+    "_comment": "Live sending. pose_cmd_convention must be set from evidence before anything is sent: 'relative_to_neutral' (like /{side}_arm/end_pose) or 'arm_base' (absolute link6 pose in {side}_arm_base_link). 'unverified' blocks all sending.",
+    "backend": "sdk",
+    "sdk_address": "x2://192.168.77.2:50051",
+    "max_joint_step_deg": 0.5,
+    "interp_hz": 50,
+    "pose_cmd_convention": "relative_to_neutral",
+    "_evidence": "2026-11-22: robot recordings bag_logs/2026-11-05-14-04..14-40 (12 arm sessions, commands spanning 5-52 cm): arm followed pose_cmd within 1-4 mm median, 60-100 ms later, as relative_to_neutral; arm_base convention was off by 215-218 mm. Platform frame_id is empty.",
+    "arrival_tolerance_m": 0.004,
+    "arrival_tolerance_deg": 2.0,
+    "step_timeout_s": 4.0,
+    "gripper_timeout_s": 3.0,
+    "republish_hz": 20,
+    "foreign_traffic_window_s": 1.0,
+    "max_plan_age_s": 60,
+    "max_start_drift_deg": 1.0
+  }
+}

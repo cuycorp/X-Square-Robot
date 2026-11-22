@@ -8,7 +8,8 @@ description: Wall-X VLA protocol reference (public_v2 request/response, msgpack 
 Sources: `docs/API Tutorial & User Guide - 2610 (Condensed Version).pdf` (redact `sk-…` when
 extracting) and `docs/Hackathon Participant Guide.pdf`.
 
-- Endpoints: on-site `ws://HOST:33677` (ask the organizers for HOST) or cloud `wss://maas-api.x2robot.com/v1/vla/wallx`.
+- Endpoint: cloud `wss://maas-api.x2robot.com/v1/vla/wallx`. This event has no on-site endpoint (the tutorial's
+  `ws://HOST:33677` does not apply). Measured from the venue: connect + handshake ~1.3 s, WebSocket RTT median ~290 ms.
 - Auth: HTTP handshake header `Authorization: Bearer <key>` from `WALLX_HEADERS_FILE`
   (`~/.config/wallx/headers.json`). Verified earlier against the cloud endpoint.
 - Wall-X is an action model, not a chat endpoint.
@@ -66,7 +67,7 @@ kept and frames ≥ 6 appended (`[f[0], *f[6:]]` for every key). First request: 
 ## Probe (handshake only; never moves the robot)
 
 ```bash
-WALLX_HEADERS_FILE=~/.config/wallx/headers.json WALLX_ENDPOINT='<endpoint>' \
+WALLX_HEADERS_FILE=~/.config/wallx/headers.json WALLX_ENDPOINT='wss://maas-api.x2robot.com/v1/vla/wallx' \
   .venv/bin/python .claude/skills/wallx-api/scripts/wallx_probe.py
 # one inference from a saved observation (reply saved, not executed):
 .venv/bin/python .claude/skills/wallx-api/scripts/wallx_probe.py --observation observation.json --instruction "Pick up the cup."

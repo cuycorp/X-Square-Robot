@@ -1,0 +1,53 @@
+{
+    "mode": "benchmark",
+    "task_name": "cup_into_bowl_test",
+    "model": {
+        "config_name": "wallx_cloud_direct",
+        "deploy": "lan",
+        "model_address": "wss://maas-api.x2robot.com/v1/vla/wallx",
+        "robot_type": "DESKTOP",
+        "mode_type": "EndPose",
+        "infer_type": "sync",
+        "infer_params": {
+            "action_horizon": 32,
+            "control_dt": 0.005,
+            "interpolate_multiplier": 8,
+            "async_params": {
+                "api_schema": "public_v2",
+                "embodiment": "quanta_x1_pro/gripper-g",
+                "normalization": "provided",
+                "control_context": "masked"
+            }
+        }
+    },
+    "data": [
+        {
+            "case_id": 1,
+            "instruction": "Pick up the cup and put it in the bowl.",
+            "image_path": "",
+            "env_description": {
+                "cup": "upright on the table, about 15 cm to the left of the bowl",
+                "bowl": "near the center of the workspace, within reach of both arms"
+            },
+            "scores_dict": {
+                "Grasp the cup": 3,
+                "Place and release the cup inside the bowl": 7
+            },
+            "timeout": 120
+        },
+        {
+            "case_id": 2,
+            "instruction": "Pick up the cup and put it in the bowl.",
+            "image_path": "",
+            "env_description": {
+                "cup": "upright on the table, about 15 cm to the right of the bowl",
+                "bowl": "near the center of the workspace, within reach of both arms"
+            },
+            "scores_dict": {
+                "Grasp the cup": 3,
+                "Place and release the cup inside the bowl": 7
+            },
+            "timeout": 120
+        }
+    ]
+}

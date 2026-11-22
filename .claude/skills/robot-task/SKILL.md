@@ -13,8 +13,8 @@ Drafts live in `tasks/` here. Template: `tasks/local_my_task_benchmark.json`.
 - Filename `local_<task_id>.json`, task_id `[a-z0-9_-]+`. `collection_id` = filename minus `.json`
   (omit it, or match exactly). `mode: "benchmark"`. `task_name` is the display name.
 - `model`: `robot_type: DESKTOP`, `mode_type: EndPose`, `infer_type: sync`, `deploy: lan`.
-  - `model_address`: the Wall-X endpoint for direct runs (on-site `ws://HOST:33677` or
-    `wss://maas-api.x2robot.com/v1/vla/wallx`); `ws://192.168.77.18:8001` when going through the harness.
+  - `model_address`: `wss://maas-api.x2robot.com/v1/vla/wallx` for direct runs (there is no on-site
+    endpoint at this event); `ws://192.168.77.18:8001` when going through the harness.
   - `infer_params` (G gripper):
     ```json
     {"action_horizon": 32, "control_dt": 0.005, "interpolate_multiplier": 8,

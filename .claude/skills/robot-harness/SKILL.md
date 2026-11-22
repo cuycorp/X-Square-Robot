@@ -21,7 +21,7 @@ the `wallx-api` skill.
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r harness/requirements.txt
 (cd harness && ../.venv/bin/python -m unittest -v test_harness.py)   # offline: no robot, no API
-export WALLX_ENDPOINT='<on-site ws://HOST:33677 or wss://maas-api.x2robot.com/v1/vla/wallx>'
+export WALLX_ENDPOINT='wss://maas-api.x2robot.com/v1/vla/wallx'
 export WALLX_HEADERS_FILE=~/.config/wallx/headers.json
 ```
 

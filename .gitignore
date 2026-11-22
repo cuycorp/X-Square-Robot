@@ -11,3 +11,10 @@ out.txt
 # Organizer PDFs: the API tutorial contains the Wall-X key in plain text
 docs/*.pdf
 *.pdf
+
+# Browser test artifacts
+.playwright-mcp/
+
+# Robot description cached from the robot (organizer file)
+.cache/
+.venv-sdk/

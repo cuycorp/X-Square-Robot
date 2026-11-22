@@ -1,0 +1,7 @@
+# Our code (perception/, motion/). The organizer demo has its own harness/requirements.txt.
+websockets>=15,<18
+msgpack>=1.0,<2
+msgpack-numpy>=0.4.8,<0.5
+numpy>=1.26,<3
+pillow>=10,<13
+rosbags>=0.10,<1        # reading the robot's .mcap recordings (motion/record_commands.py --analyze)
