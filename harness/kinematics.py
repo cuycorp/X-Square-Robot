@@ -160,17 +160,41 @@ def measured_pose(chain: list[Joint], measured: dict[str, float]) -> tuple[list[
     return transform[:3, 3].tolist(), matrix_to_rpy(transform[:3, :3])
 
 
+def pose_target(
+    chain: list[Joint],
+    measured: dict[str, float],
+    position: np.ndarray,
+    rotation: np.ndarray,
+    *,
+    position_tolerance: float = 0.001,
+    rotation_tolerance: float = 0.01,
+    max_joint_delta_rad: float = math.radians(20),
+) -> dict[str, float]:
+    names, angles, lower, upper = _joint_state(chain, measured)
+    solution = _solve(chain, names, angles, lower, upper, position, rotation, position_tolerance, rotation_tolerance)
+    if not solution["converged"]:
+        raise ValueError("No joint solution for this target")
+    joints = solution["joints"]
+    limit_deg = math.degrees(max_joint_delta_rad)
+    if max(abs(joints[name] - angle) for name, angle in zip(names, angles)) > max_joint_delta_rad:
+        raise ValueError(
+            f"This Cartesian step requires more than {limit_deg:g} degrees at a joint. Try a smaller increment."
+        )
+    return joints
+
+
 def small_pose_target(
     chain: list[Joint], measured: dict[str, float], position: np.ndarray, rotation: np.ndarray
 ) -> dict[str, float]:
-    names, angles, lower, upper = _joint_state(chain, measured)
-    solution = _solve(chain, names, angles, lower, upper, position, rotation, 0.00025, 0.003)
-    if not solution["converged"]:
-        raise ValueError("No joint solution for this increment")
-    joints = solution["joints"]
-    if max(abs(joints[name] - angle) for name, angle in zip(names, angles)) > math.radians(3):
-        raise ValueError("This Cartesian step requires more than 3 degrees at a joint. Try a smaller increment.")
-    return joints
+    return pose_target(
+        chain,
+        measured,
+        position,
+        rotation,
+        position_tolerance=0.00025,
+        rotation_tolerance=0.003,
+        max_joint_delta_rad=math.radians(3),
+    )
 
 
 def jog_target(

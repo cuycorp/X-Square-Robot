@@ -258,24 +258,33 @@ class TestKinematicsPreview(unittest.TestCase):
                 self.assertEqual(status.snapshot()["status"], "completed")
                 previous_step = status.snapshot()["motion_feedback"]["previous_step"]
                 self.assertIn("accepted", previous_step["command"])
-                self.assertAlmostEqual(previous_step["measured_left_delta_xyz_mm"][2], 5, delta=0.25)
+                self.assertAlmostEqual(previous_step["measured_left_delta_xyz_mm"][2], 30, delta=1.5)
                 self.assertEqual(planner.decide.call_args.args[0].perception["last_sdk_step"], previous_step)
-                robot.left_arm.set_joint_positions.assert_called_once()
+                calls = robot.left_arm.set_joint_positions.call_args_list
+                self.assertGreaterEqual(len(calls), 2)
+                prev_q = np.array(list(seed.values()), dtype=float)
+                for call in calls:
+                    next_q = np.array(call.args[0].positions, dtype=float)
+                    self.assertLessEqual(float(np.max(np.abs(next_q - prev_q))), np.deg2rad(0.65))
+                    prev_q = next_q
                 robot.right_arm.set_joint_positions.assert_not_called()
                 robot.left_gripper.set_position.assert_not_called()
                 robot.right_gripper.set_position.assert_not_called()
-                command = robot.left_arm.set_joint_positions.call_args.args[0].positions
+                command = calls[-1].args[0].positions
                 initial = preview(self.urdf, "left", seed, None)["pose"]
                 target = preview(self.urdf, "left", dict(zip(seed, command)), None)["pose"]
-                np.testing.assert_allclose(np.subtract(target[:3], initial[:3]), [0, 0, 0.005], atol=0.00025)
+                np.testing.assert_allclose(np.subtract(target[:3], initial[:3]), [0, 0, 0.03], atol=0.0012)
 
                 finished.clear()
                 arrived.clear()
                 resume.clear()
                 planner.reset_mock()
                 robot.left_arm.set_joint_positions.reset_mock()
-                self.assertTrue(post("/api/prompt", {"prompt": "Lift the cube again"})["ok"])
+                self.assertTrue(post("/api/prompt", {"prompt": "Lift the cube again", "use_cube_depth": False})["ok"])
                 self.assertTrue(arrived.wait(3))
+                first_instruction = planner.decide.call_args.args[0].instruction
+                self.assertIn("RGB-only mode", first_instruction)
+                self.assertNotIn("local_perception.cube_depth reports", first_instruction)
                 self.assertTrue(post("/api/direct/stop", {})["ok"])
                 resume.set()
                 self.assertTrue(finished.wait(5))

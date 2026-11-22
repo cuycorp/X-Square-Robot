@@ -12,13 +12,23 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from claude_policy import ClaudeEndPosePlanner, PlannerDecision, load_anthropic_api_key
 from cube_depth import camera_mount
 from direct_claude import DirectClaudeControl
-from kinematics import arm_chain, jog_target, measured_pose, small_pose_target
+from kinematics import arm_chain, jog_target, measured_pose, pose_target
 from protocol import ArmState, ValidatedRequest
 from server import PromptController, start_console_http_server
-from trajectory import WorkspaceLimits, clamp_pose, matrix_to_rpy, rotation_distance
+from trajectory import WorkspaceLimits, _min_jerk, clamp_pose, matrix_to_rpy, rotation_distance
+
+
+DIRECT_MAX_STEP_POS_M = 0.03
+DIRECT_MAX_STEP_ROT_RAD = math.radians(12)
+DIRECT_MAX_TRAVEL_RADIUS_M = 0.35
+DIRECT_SUBSTEP_MAX_JOINT_RAD = math.radians(0.6)
+DIRECT_INTERP_PERIOD_S = 0.022
+DIRECT_SETTLE_TIMEOUT_S = 0.6
 
 
 class DesktopJogger:
@@ -125,6 +135,17 @@ class DesktopJogger:
                 states[f"{arm}_ee"] = self._measured_arm(arm, current)
         return states
 
+    def _wait_arm_settled(self, controller: Any, arm: str, stop: threading.Event) -> None:
+        expected = [f"{arm}_arm_joint{index}" for index in range(1, 7)]
+        deadline = time.monotonic() + DIRECT_SETTLE_TIMEOUT_S
+        while True:
+            current = controller.get_joint_states(timeout=1)
+            velocity = dict(zip(current.name, current.velocity))
+            if all(abs(velocity.get(name, math.inf)) <= 0.1 for name in expected):
+                return
+            if time.monotonic() >= deadline or stop.wait(0.04):
+                return
+
     def apply_direct(
         self, observation: ValidatedRequest, decision: PlannerDecision,
         start_position: list[float], stop: threading.Event, expires_at: float,
@@ -133,9 +154,9 @@ class DesktopJogger:
             actual = ArmState(**self._measured_arm("left", current))
             planned_from = observation.left_ee
             if (
-                math.dist(actual.position, planned_from.position) > 0.003
-                or rotation_distance(actual.rotation_rpy, planned_from.rotation_rpy) > math.radians(1)
-                or abs(actual.gripper - planned_from.gripper) > 0.04
+                math.dist(actual.position, planned_from.position) > 0.004
+                or rotation_distance(actual.rotation_rpy, planned_from.rotation_rpy) > math.radians(1.5)
+                or abs(actual.gripper - planned_from.gripper) > 0.05
             ):
                 raise RuntimeError("The left arm moved while Claude was planning. Start a fresh run.")
             if (
@@ -147,27 +168,57 @@ class DesktopJogger:
             position, rotation, opening = clamp_pose(
                 decision.left_target_pos, decision.left_target_rpy, decision.left_gripper, actual,
                 self.gripper_limits["left"],
-                WorkspaceLimits(max_step_pos_m=0.005, max_step_rot_rad=math.radians(1)),
+                WorkspaceLimits(max_step_pos_m=DIRECT_MAX_STEP_POS_M, max_step_rot_rad=DIRECT_MAX_STEP_ROT_RAD),
             )
-            if math.dist(position, start_position) > 0.20:
-                raise RuntimeError("The target exceeds the 20 cm travel radius for this run.")
+            if math.dist(position, start_position) > DIRECT_MAX_TRAVEL_RADIUS_M:
+                raise RuntimeError("The target exceeds the 35 cm travel radius for this run.")
             measured = dict(zip(current.name, current.position))
             moving = (
                 math.dist(position, actual.position) > 0.0005
                 or rotation_distance(actual.rotation_rpy, matrix_to_rpy(rotation)) > 0.004
             )
-            joints = small_pose_target(self.chains["left"], measured, position, rotation) if moving else None
+            joints = pose_target(self.chains["left"], measured, position, rotation) if moving else None
             if stop.is_set() or time.monotonic() >= expires_at:
                 raise RuntimeError("The run stopped or the observation expired before dispatch.")
             if joints is not None:
-                self._send_joint_target(controller, joints)
+                names = list(joints.keys())
+                q_start = np.array([measured[name] for name in names], dtype=float)
+                q_goal = np.array([joints[name] for name in names], dtype=float)
+                max_dq = float(np.max(np.abs(q_goal - q_start)))
+                substeps = max(1, math.ceil(1.9 * max_dq / DIRECT_SUBSTEP_MAX_JOINT_RAD))
+                for step_idx in range(1, substeps + 1):
+                    if stop.is_set() or time.monotonic() >= expires_at:
+                        raise RuntimeError("The run stopped or the observation expired before dispatch.")
+                    blend = _min_jerk(step_idx / substeps)
+                    q_cmd = q_start + blend * (q_goal - q_start)
+                    self._busy_until = time.monotonic() + 0.25
+                    result = controller.set_joint_positions(
+                        self.command_type(positions=q_cmd.tolist()), timeout=1
+                    )
+                    if not result.is_success:
+                        raise RuntimeError(f"SDK rejected the jog: {result.error_message}")
+                    if step_idx < substeps and stop.wait(DIRECT_INTERP_PERIOD_S):
+                        raise RuntimeError("Direct Claude control stopped.")
+                self._wait_arm_settled(controller, "left", stop)
+                self._busy_until = time.monotonic() + 0.08
                 return "left arm target accepted by SDK"
             if abs(opening - actual.gripper) > 0.025:
-                target = actual.gripper + max(-0.15, min(0.15, opening - actual.gripper))
-                self._busy_until = time.monotonic() + 0.4
-                result = self.robot.left_gripper.set_position(self.gripper_type(position=target), timeout=2)
-                if not result.is_success:
-                    raise RuntimeError(f"SDK rejected the gripper target: {result.error_message}")
+                delta_g = opening - actual.gripper
+                g_steps = max(1, math.ceil(abs(delta_g) / 0.35))
+                for g_idx in range(1, g_steps + 1):
+                    if stop.is_set() or time.monotonic() >= expires_at:
+                        raise RuntimeError("The run stopped or the observation expired before dispatch.")
+                    g_cmd = actual.gripper + _min_jerk(g_idx / g_steps) * delta_g
+                    self._busy_until = time.monotonic() + 0.35
+                    result = self.robot.left_gripper.set_position(
+                        self.gripper_type(position=float(g_cmd)), timeout=2
+                    )
+                    if not result.is_success:
+                        raise RuntimeError(f"SDK rejected the gripper target: {result.error_message}")
+                    if g_idx < g_steps and stop.wait(0.05):
+                        raise RuntimeError("Direct Claude control stopped.")
+                stop.wait(0.2)
+                self._busy_until = time.monotonic() + 0.08
                 return "left gripper target accepted by SDK"
             return "hold"
 

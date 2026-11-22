@@ -24,16 +24,31 @@ CAMERA_TOPICS = {
 }
 EMBODIMENT = "quanta_x1_pro/gripper-g"
 OPERATOR_TIMEOUT = 6.0
-TASK_CONTEXT = (
+BASE_TASK_CONTEXT = (
     "Use only the left arm and omit right_ee from every waypoint. "
     "Reported poses are gripper-base poses in the robot base_link frame. "
-    "Use last_sdk_step measured feedback to tell whether a command moved the arm. "
-    "A fresh local_perception.cube_depth cube_top_center_m measures the top face, not a gripper target. "
-    "Use its base_link x/y for alignment and the nearby table_z_m to reason about vertical clearance. "
-    "This measurement does not check arm collisions or assure a clear path. "
+    "Each control cycle smoothly executes up to 30 mm translation and 12 deg rotation toward your active waypoint (or completes a gripper move). "
+    "Use last_sdk_step and since_last_plan measured displacement feedback together with the updated cameras to verify arm motion. "
     "Keep approach and gripper changes in separate waypoints. "
-    "Return retry if the target, approach or tabletop clearance is uncertain. "
 )
+CUBE_DEPTH_CONTEXT = (
+    "local_perception.cube_depth reports cube_top_center_m (the cube's top face, not a gripper target) and nearby table_z_m in base_link. "
+    "Use its x/y for alignment and table_z_m to maintain vertical clearance. "
+    "If last_seen is present while the moving arm briefly blocks the front view, rely on last_seen for the stationary tabletop cube and align visually with left_wrist. "
+    "Return retry if the target, approach, or tabletop clearance is uncertain. "
+)
+RGB_ONLY_CONTEXT = (
+    "RGB-only mode (no depth measurement is attached): do not wait for cube_depth or table_z_m. "
+    "Use the front and left_wrist RGB views for progressive visual servoing in 2 to 4 cm increments while keeping safe clearance above the table. "
+    "Center the target in left_wrist before descending to grasp, and verify each move using last_sdk_step and visual parallax. "
+    "Return retry only if the target object is missing, held or unsafe, or all camera views are blocked. "
+)
+TASK_CONTEXT = BASE_TASK_CONTEXT + CUBE_DEPTH_CONTEXT
+
+
+def build_task_instruction(task: str, *, use_cube_depth: bool) -> str:
+    extra = CUBE_DEPTH_CONTEXT if use_cube_depth else RGB_ONLY_CONTEXT
+    return BASE_TASK_CONTEXT + extra + task
 
 
 def _stamp(message: dict) -> int:
@@ -56,7 +71,7 @@ def read_camera_snapshot(
     with connect(url, open_timeout=3, close_timeout=0.5, max_size=4 * 1024 * 1024, proxy=None) as socket:
         topics = [*CAMERA_TOPICS, *(DEPTH_TOPICS if front_mount is not None else ())]
         for topic in topics:
-            options = {"queue_length": 1, "throttle_rate": 300}
+            options = {"queue_length": 1, "throttle_rate": 100}
             if topic == "/tf_static":
                 options = {"qos": {"durability": "transient_local", "reliability": "reliable", "depth": 10}}
             socket.send(json.dumps({"op": "subscribe", "topic": topic, **options}))
@@ -177,11 +192,14 @@ class DirectClaudeControl:
         static_cache = {}
         previous_left = None
         previous_action = None
+        last_plan_left = None
+        last_plan_count = 0
         is_cube_task = use_cube_depth and "cube" in task.casefold()
+        instruction = build_task_instruction(task, use_cube_depth=is_cube_task)
         try:
             planner = ClaudeEndPosePlanner(
                 api_key=self.key_planner.api_key, base_url=self.key_planner.base_url,
-                model=self.key_planner.model, timeout_s=14,
+                model=self.key_planner.model, timeout_s=14, plan_every=2,
             )
             for index in range(1, 101):
                 if stop.is_set():
@@ -206,7 +224,7 @@ class DirectClaudeControl:
                     break
                 states = self.jogger.observe_direct(stop)
                 observation = validate_request({
-                    "embodiment": EMBODIMENT, "normalization": "provided", "instruction": TASK_CONTEXT + task,
+                    "embodiment": EMBODIMENT, "normalization": "provided", "instruction": instruction,
                     "observation": {"images": images, "state": states},
                 })
                 if measured and measured["status"] == "measured":
@@ -228,10 +246,23 @@ class DirectClaudeControl:
                         "measured_left_delta_xyz_mm": displacement,
                         "measured_left_gripper_delta_rad": round(observation.left_ee.gripper - previous_left.gripper, 4),
                     }
+                if last_plan_left is not None:
+                    context["since_last_plan"] = {
+                        "measured_left_delta_xyz_mm": [
+                            round(1000 * (actual - previous), 2)
+                            for actual, previous in zip(observation.left_ee.position, last_plan_left.position)
+                        ],
+                        "measured_left_gripper_delta_rad": round(observation.left_ee.gripper - last_plan_left.gripper, 4),
+                    }
                 observation.perception = context or None
                 if origin is None:
                     origin = list(observation.left_ee.position)
                 decision = planner.decide(observation)
+                history = getattr(planner, "history", None)
+                history_len = len(history) if isinstance(history, list) else 0
+                if history_len > last_plan_count or last_plan_left is None:
+                    last_plan_count = history_len
+                    last_plan_left = observation.left_ee
                 if stop.is_set():
                     break
                 if time.monotonic() >= self._operator_expires_at:
@@ -254,7 +285,7 @@ class DirectClaudeControl:
                     break
                 previous_left = observation.left_ee
                 previous_action = action
-                if stop.wait(0.65):
+                if stop.wait(0.12):
                     break
             else:
                 outcome, reason = "limit", "Reached the direct control observation limit."
