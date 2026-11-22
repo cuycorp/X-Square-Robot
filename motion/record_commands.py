@@ -35,6 +35,7 @@ for _s in K.ARMS:
     TOPICS[f"/{_s}_arm_cartesian_controller/pose_cmd"] = "geometry_msgs/msg/PoseStamped"
     TOPICS[f"/{_s}_arm/end_pose"] = "geometry_msgs/msg/PoseStamped"
     TOPICS[f"/{_s}_arm/joint_states"] = "sensor_msgs/msg/JointState"   # faster than end_pose; same pose via FK
+    TOPICS[f"/{_s}_arm_joint_controller/commands"] = "std_msgs/msg/Float64MultiArray"  # what the SDK may send in joint mode
     TOPICS[f"/{_s}_gripper_controller/commands"] = "std_msgs/msg/Float64MultiArray"
     TOPICS[f"/{_s}_gripper/joint_states"] = "sensor_msgs/msg/JointState"
 
@@ -225,12 +226,63 @@ def verdict(report) -> list:
     return lines
 
 
+DISCOVER_KEYS = ("cmd", "command", "target", "action", "servo", "control", "goal", "traj", "desired", "sdk")
+DISCOVER_SKIP = ("image", "camera", "compressed", "point", "audio", "speech", "parameter_events", "rosout", "tf",
+                 "diagnostic", "transition_event", "/vr")
+
+
+def discover(seconds: float, url: str = ROSBRIDGE_URL) -> list:
+    """Listen (only) to every robot topic whose name suggests commands/targets; return [(topic, type, count)]
+    sorted by count. Used to find which channel the SDK really uses to drive the arms."""
+    from websockets.sync.client import connect
+    with connect(url, open_timeout=5, max_size=None) as ws:
+        ws.send(json.dumps({"op": "call_service", "service": "/rosapi/topics", "id": "topics"}))
+        end = time.monotonic() + 10
+        while True:
+            m = json.loads(ws.recv(timeout=max(0.1, end - time.monotonic())))
+            if m.get("id") == "topics":
+                break
+        v = m.get("values") or {}
+        cands = [(t, ty) for t, ty in zip(v.get("topics", []), v.get("types", []))
+                 if any(k in t.lower() for k in DISCOVER_KEYS) and not any(k in t.lower() for k in DISCOVER_SKIP)]
+        for t, ty in cands:
+            ws.send(json.dumps({"op": "subscribe", "id": f"d{t}", "topic": t, "type": ty, "throttle_rate": 50}))
+        counts = {t: 0 for t, _ in cands}
+        start, last_print = time.monotonic(), time.monotonic()
+        print(f"Listening to {len(cands)} command-like topics for {seconds:.0f} s (read-only)…", flush=True)
+        while time.monotonic() - start < seconds:
+            try:
+                m = json.loads(ws.recv(timeout=0.5))
+            except TimeoutError:
+                continue
+            if m.get("op") == "publish" and m.get("topic") in counts:
+                counts[m["topic"]] += 1
+            if time.monotonic() - last_print > 5:
+                print(f"  {time.monotonic() - start:4.0f} s: {sum(counts.values())} messages on {sum(1 for c in counts.values() if c)} topics", flush=True)
+                last_print = time.monotonic()
+        for t, _ in cands:
+            ws.send(json.dumps({"op": "unsubscribe", "id": f"d{t}", "topic": t}))
+    types = dict(cands)
+    return sorted(((t, types[t], c) for t, c in counts.items()), key=lambda x: -x[2])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=15)
+    ap.add_argument("--discover", action="store_true",
+                    help="listen to ALL command-like topics and report which ones carry messages (find the SDK's channel)")
     ap.add_argument("--analyze", metavar="FILE", help="analyse an existing recording (.jsonl, or a robot rosbag dir/.mcap)")
     ap.add_argument("--topics", metavar="BAG", help="list the topics in a robot rosbag (dir or .mcap)")
     a = ap.parse_args()
+    if a.discover:
+        rows = discover(a.seconds)
+        active = [r for r in rows if r[2]]
+        print(f"\nTopics that carried messages ({len(active)} of {len(rows)}):")
+        for t, ty, c in active:
+            print(f"{c:8d}  {t}  [{ty}]")
+        if not active:
+            print("  none: the SDK drives the arms through something other than ROS topics")
+        return 0
     if a.topics:
         for topic, typ, n in bag_topics(Path(a.topics)):
             mark = "  <-- used" if topic in TOPICS else ""

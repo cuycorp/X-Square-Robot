@@ -21,13 +21,16 @@
   body { margin: 0; background: var(--bg); color: var(--ink);
          font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   header { display: flex; align-items: center; gap: 12px; padding: 14px 20px;
-           border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+           border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap;
+           position: sticky; top: 0; z-index: 5; }   /* stays visible while scrolling: Architecture + status */
   header h1 { font-size: 17px; margin: 0; font-weight: 650; }
   .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted);
           border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
   .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
   .spacer { flex: 1; }
+  a.navlink { color: var(--accent); border-color: var(--accent); text-decoration: none; font-weight: 600; }
+  a.navlink:hover, a.navlink:focus-visible { background: var(--accent); color: var(--accent-ink); outline: none; }
   main { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr); gap: 16px;
          padding: 16px 20px; max-width: 1500px; margin: 0 auto; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
@@ -106,6 +109,7 @@
   <h1>Robot Eyes</h1>
   <span class="pill"><span id="dot" class="dot"></span><span id="status">connecting…</span></span>
   <span class="spacer"></span>
+  <a class="pill navlink" href="/architecture" target="_blank" rel="noopener" title="How the software fits together (opens in a new tab)">Architecture</a>
   <span class="pill" id="model">model: …</span>
 </header>
 
@@ -158,7 +162,7 @@
         <button class="chip" id="sdkOff">Exit SDK mode</button>
         <span class="spacer"></span>
         <button class="primary" id="robotEstop" style="background:var(--bad)" title="SDK emergency stop">Robot E-stop</button>
-        <button class="chip" id="recoverEstop">Recover</button>
+        <button class="chip" id="recoverEstop" title="Release the robot E-stop pressed in this UI. Does not move the arms.">Release E-stop</button>
       </div>
       <div class="kv">Directions are from the robot's point of view (its left / right / forward / up).</div>
       <div id="execBox" style="display:none" class="banner">
@@ -167,8 +171,9 @@
         <div class="kv">Stop holds the arm where it is. In an emergency press the red E-stop on the robot.</div>
       </div>
       <label class="block" for="moveCmd">Movement command</label>
-      <textarea id="moveCmd" placeholder="e.g. left arm up 2 cm · right arm forward 3 cm and open the gripper · pick the cube in front of you"></textarea>
-      <div class="row"><span class="spacer"></span><button class="primary" id="plan">Plan move</button></div>
+      <textarea id="moveCmd" placeholder="e.g. left arm up 2 cm · open the right gripper · right arm go home · pick the cube in front of you"></textarea>
+      <div class="row"><button class="chip" id="homeBoth" title="Plan sending both arms to the ready pose, one after the other">Both arms home</button>
+        <span class="spacer"></span><button class="primary" id="plan">Plan move</button></div>
       <div id="planOut"></div>
     </section>
 
@@ -347,8 +352,19 @@ function renderPick(d) {
     ${liveControls(d)}`;
 }
 
+function renderHome(d) {
+  const h = d.home;
+  const fail = h.failure ? `<ul class="checks">${h.failure.failed.map(f => `<li><span class="fail">✗</span><span>${esc(f)}</span></li>`).join("")}</ul>` : "";
+  return `<p>${esc(d.explanation)}</p>
+    <div class="verdict ${d.ok ? "ok" : "blocked"}">${d.ok ? `Return to the ready pose passes every check (${h.order.map(esc).join(" arm, then ")} arm · ${h.steps} joint steps of ≤ 10°)` : "No safe way home found"}</div>
+    ${fail}
+    <div class="meta">${esc(d.model)} · interpret ${d.model_ms} ms · checks ${d.plan_ms ?? "–"} ms</div>
+    ${liveControls(d)}`;
+}
+
 function renderPlan(d) {
   if (d.pick) return renderPick(d);
+  if (d.home) return renderHome(d);
   if (d.clarification && !d.moves.length) return `<p class="answer">The model needs more detail: ${esc(d.clarification)}</p>`;
   const moves = d.moves.map(m => {
     const t = m.translate_cm, r = m.rotate_deg;
@@ -383,6 +399,10 @@ function liveControls(d) {
 
 document.addEventListener("click", async (e) => {
   if (e.target.id !== "execBtn" || !lastPlan?.live?.plan_id) return;
+  if (robotModeName !== "SDK") {
+    alert(`The robot is in "${robotModeName}" mode. Click "Enter SDK mode" first, then Plan move again (the arm settles slightly when SDK mode starts).`);
+    return;
+  }
   const what = lastPlan.pick ? `pick ${lastPlan.pick.object} with the ${lastPlan.pick.arm} arm` : lastPlan.explanation;
   if (!confirm(`The robot will MOVE:\n\n${what}\n(${lastPlan.live.steps} checked steps)\n\nWorkspace clear and hand on the E-stop?`)) return;
   try {
@@ -403,9 +423,14 @@ async function post(path, body) {
   if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
   return d;
 }
+let robotModeName = "unknown";
 async function refreshMode() {
-  try { const m = await (await fetch("/robot_mode")).json(); $("robotMode").textContent = m.name || "unknown"; }
-  catch { $("robotMode").textContent = "unknown"; }
+  try { const m = await (await fetch("/robot_mode")).json(); robotModeName = m.name || "unknown"; }
+  catch { robotModeName = "unknown"; }
+  $("robotMode").textContent = robotModeName;
+  const needSdk = robotModeName !== "SDK";
+  $("sdkOn").className = needSdk ? "primary" : "chip";       // highlight when the robot is not in SDK mode
+  $("sdkOn").title = needSdk ? "Needed before Execute (also after every server restart)" : "";
 }
 async function setSdk(on) {
   const q = on ? "Switch the robot into SDK mode?\n\nThe robot is SHARED: make sure your teammates are clear of the arms and not using it."
@@ -417,12 +442,12 @@ async function setSdk(on) {
 $("sdkOn").onclick = () => setSdk(true);
 $("sdkOff").onclick = () => setSdk(false);
 $("robotEstop").onclick = async () => {
-  try { await post("/robot_estop", {}); alert("Robot E-stop sent. Use Recover when it is safe."); }
+  try { await post("/robot_estop", {}); alert("Robot E-stop sent. Use Release E-stop when it is safe."); }
   catch (e) { alert("E-stop via SDK failed (" + e.message + "). PRESS THE RED E-STOP ON THE ROBOT."); }
   pollExec();
 };
 $("recoverEstop").onclick = async () => {
-  if (!confirm("Recover from the robot E-stop? The workspace must be clear.")) return;
+  if (!confirm("Release the robot E-stop? The arms will accept commands again (they do not move by themselves). The workspace must be clear.")) return;
   try { await post("/robot_estop", { recover: true }); } catch (e) { alert("Recover failed: " + e.message); }
 };
 refreshMode();
@@ -447,6 +472,7 @@ async function pollExec() {
 pollExec();
 
 $("plan").onclick = planMove;
+$("homeBoth").onclick = () => { $("moveCmd").value = "both arms go home"; planMove(); };
 $("moveCmd").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); planMove(); } });
 refreshArms();
 setInterval(refreshArms, 1000);

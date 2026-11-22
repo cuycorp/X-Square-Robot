@@ -41,15 +41,35 @@ def _one(ws, topic, typ, timeout=8.0):
         ws.send(json.dumps({"op": "unsubscribe", "topic": topic, "id": f"v3d{topic}"}))
 
 
-def fetch_calibration(rosbridge_url: str) -> dict:
-    """Camera intrinsics + static transforms from the robot; cached so it also works offline."""
+def chain_complete(tfs: dict) -> bool:
+    """True when both head-camera optical frames link up to an arm base (then the URDF reaches base_link)."""
+    for frame in (COLOR_OPTICAL, DEPTH_OPTICAL):
+        seen = set()
+        while frame in tfs and frame not in seen and not frame.endswith("_arm_base_link"):
+            seen.add(frame)
+            frame = tfs[frame]["parent"]
+        if not (frame.endswith("_arm_base_link") or frame == "base_link"):
+            return False
+    return True
+
+
+def fetch_calibration(rosbridge_url: str, tf_timeout: float = 10.0) -> dict:
+    """Camera intrinsics + static transforms from the robot; cached so it also works offline.
+
+    /tf_static comes from several publishers, and rosbridge does not always deliver all of them quickly, so
+    transforms are merged with the cached ones and collection continues until the camera chain is complete.
+    An incomplete set is never written to the cache.
+    """
     from websockets.sync.client import connect
+    cached = json.loads(CACHE.read_text()) if CACHE.exists() else {}
     try:
         with connect(rosbridge_url, open_timeout=5, max_size=None) as ws:
             info = {k: _one(ws, t, "sensor_msgs/msg/CameraInfo") for k, t in (("color", COLOR_INFO), ("depth", DEPTH_INFO))}
             ws.send(json.dumps({"op": "subscribe", "topic": "/tf_static", "type": "tf2_msgs/msg/TFMessage", "id": "v3dtf"}))
-            tfs, end = {}, time.monotonic() + 3
-            while time.monotonic() < end:
+            fresh, start = {}, time.monotonic()
+            while time.monotonic() - start < tf_timeout:
+                if time.monotonic() - start > 2 and chain_complete(fresh):
+                    break
                 try:
                     m = json.loads(ws.recv(timeout=0.5))
                 except TimeoutError:
@@ -57,9 +77,13 @@ def fetch_calibration(rosbridge_url: str) -> dict:
                 if m.get("topic") == "/tf_static":
                     for t in m["msg"]["transforms"]:
                         tr, r = t["transform"]["translation"], t["transform"]["rotation"]
-                        tfs[t["child_frame_id"]] = {"parent": t["header"]["frame_id"],
-                                                    "t": [tr["x"], tr["y"], tr["z"]], "q": [r["x"], r["y"], r["z"], r["w"]]}
+                        fresh[t["child_frame_id"]] = {"parent": t["header"]["frame_id"],
+                                                      "t": [tr["x"], tr["y"], tr["z"]], "q": [r["x"], r["y"], r["z"], r["w"]]}
             ws.send(json.dumps({"op": "unsubscribe", "topic": "/tf_static", "id": "v3dtf"}))
+            tfs = {**cached.get("tf_static", {}), **fresh}   # fresh values win; missing ones come from the cache
+            if not chain_complete(tfs):
+                raise RuntimeError("head-camera transforms incomplete (the robot did not publish the camera mount); "
+                                   "try again in a moment")
             hand_eye = {}
             for s in K.ARMS:
                 for key, topic in ((f"{s}_head", f"/calibration/extrinsic/from_{s}_gripper_camera_to_head_front_RGBD_camera"),
@@ -69,13 +93,14 @@ def fetch_calibration(rosbridge_url: str) -> dict:
                     except Exception:  # noqa: BLE001 - optional; correction is skipped without it
                         pass
         calib = {"camera_info": {k: {"width": v["width"], "height": v["height"], "k": v["k"], "d": v["d"]}
-                                 for k, v in info.items()}, "tf_static": tfs, "hand_eye": hand_eye}
+                                 for k, v in info.items()}, "tf_static": tfs,
+                 "hand_eye": hand_eye or cached.get("hand_eye", {})}
         CACHE.parent.mkdir(exist_ok=True)
         CACHE.write_text(json.dumps(calib))
         return calib
-    except Exception:  # noqa: BLE001 - fall back to the cache
-        if CACHE.exists():
-            return json.loads(CACHE.read_text())
+    except Exception:  # noqa: BLE001 - fall back to a complete cache, otherwise report
+        if cached and chain_complete(cached.get("tf_static", {})):
+            return cached
         raise
 
 

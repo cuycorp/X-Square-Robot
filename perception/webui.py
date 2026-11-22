@@ -26,6 +26,7 @@ STATIC = Path(__file__).resolve().parent / "static"
 STREAM_FPS = 4          # rosbridge throttle and browser frame rate. At 8 fps the head JPEG stream starved
                         # rosbridge (joint states dropped from ~12 Hz to <1 Hz), so keep this low.
 CAMERA_IDLE_S = 15      # unsubscribe a camera nobody has used for this long
+CAMERA_SILENT_S = 5     # re-subscribe a wanted camera that has sent nothing for this long
 MAX_FRAME_AGE_S = 3.0   # refuse to ask about a stale frame
 MAX_QUESTION_CHARS = 500
 
@@ -60,11 +61,13 @@ class FrameHub:
     def latest(self, name: str):
         with self._cond:
             self.last_use[name] = time.monotonic()
+            self.wanted.add(name)   # re-subscribe if it was dropped as idle
             return self.frames.get(name)
 
     def wait_newer(self, name: str, seq: int, timeout: float = 2.0):
         with self._cond:
             self.last_use[name] = time.monotonic()
+            self.wanted.add(name)
             self._cond.wait_for(lambda: self.frames.get(name, (0, 0, 0))[2] > seq, timeout)
             return self.frames.get(name)
 
@@ -79,13 +82,18 @@ class FrameHub:
                         ws.send(json.dumps({"op": "subscribe", "id": f"st-{name}", "topic": topic, "type": typ,
                                             "throttle_rate": 100, "queue_length": 1}))
                     by_topic = {topic: name for name, (topic, _) in self.state_topics.items()}
+                    sub_time = {}
                     while True:
                         with self._cond:
                             now = time.monotonic()
                             idle = {n for n in subscribed if now - self.last_use.get(n, 0) > CAMERA_IDLE_S}
                             self.wanted -= idle
-                            todo = self.wanted - subscribed
-                        for name in idle:
+                            # Watchdog: a wanted camera silent for CAMERA_SILENT_S gets re-subscribed (seen live:
+                            # the subscription went quiet for minutes while the camera itself kept publishing).
+                            silent = {n for n in subscribed - idle
+                                      if now - max(self.frames.get(n, (0, 0.0, 0))[1], sub_time.get(n, 0.0)) > CAMERA_SILENT_S}
+                            todo = (self.wanted - subscribed) | silent
+                        for name in idle | silent:
                             ws.send(json.dumps({"op": "unsubscribe", "id": f"ui-{name}", "topic": camera.CAMERAS[name][0]}))
                             subscribed.discard(name)
                         for name in todo:
@@ -93,6 +101,7 @@ class FrameHub:
                                                 "type": "sensor_msgs/msg/CompressedImage",
                                                 "throttle_rate": int(1000 / STREAM_FPS), "queue_length": 1}))
                             subscribed.add(name)
+                            sub_time[name] = time.monotonic()
                         try:
                             msg = json.loads(ws.recv(timeout=0.5))
                         except TimeoutError:
@@ -163,8 +172,9 @@ def make_handler(hub, model: str, motion=None):
 
         def do_GET(self):
             path = self.path.split("?", 1)[0]
-            if path in ("/", "/index.html"):
-                body = (STATIC / "index.html").read_bytes()
+            if path in ("/", "/index.html", "/architecture"):
+                page = "architecture.html" if path == "/architecture" else "index.html"
+                body = (STATIC / page).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -281,7 +291,15 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001 - the camera/ask features still work without it
         print(f"Motion planning disabled: {e}", flush=True)
         motion = None
-    server = ThreadingHTTPServer((a.host, a.port), make_handler(hub, a.model, motion))
+    try:
+        server = ThreadingHTTPServer((a.host, a.port), make_handler(hub, a.model, motion))
+    except OSError as e:
+        if e.errno == 98:  # address already in use
+            print(f"Robot Eyes is already running on port {a.port} (probably in another terminal).\n"
+                  f"Stop it there with Ctrl+C, or run:  pkill -INT -f 'perception/webui.py'\n"
+                  f"then start this command again.", flush=True)
+            return 1
+        raise
     server.daemon_threads = True
     print(f"Robot eyes UI: http://{a.host}:{a.port}  (rosbridge {hub.url}, model {a.model}). Ctrl+C to stop.", flush=True)
     try:

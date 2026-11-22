@@ -88,6 +88,14 @@ class HttpTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/", timeout=5) as r:
             self.assertIn(b"Robot Eyes", r.read())
 
+    def test_architecture_page_and_button(self):
+        with urllib.request.urlopen(self.base + "/architecture", timeout=5) as r:
+            page = r.read()
+        self.assertIn(b"Robot Eyes Stack", page)
+        self.assertIn(b'href="/"', page)                       # back link
+        with urllib.request.urlopen(self.base + "/", timeout=5) as r:
+            self.assertIn(b'href="/architecture"', r.read())   # header button
+
     def test_status(self):
         with urllib.request.urlopen(self.base + "/status", timeout=5) as r:
             s = json.loads(r.read())

@@ -13,6 +13,7 @@ import numpy as np
 
 import command_parser
 import grasp
+import home
 import kinematics as K
 import nebius_vision
 import safety
@@ -65,15 +66,18 @@ class MotionService:
 
     # ---------- live execution ----------
 
-    def _store_plan(self, steps: list, state: dict) -> dict:
-        """Keep a passing plan for execution; returns what the UI needs to offer (or refuse) execution."""
+    def _store_plan(self, steps: list, state: dict, sequential: bool = False) -> dict:
+        """Keep a passing plan for execution; returns what the UI needs to offer (or refuse) execution.
+
+        Plans move one arm at a time. A plan with both arms is accepted only when it was checked SEQUENTIALLY
+        (each arm's steps checked with the other arm where it will actually be), which is how it is executed."""
         arms = sorted({s["arm"] for s in steps})
-        if len(arms) != 1:
+        if len(arms) != 1 and not sequential:
             return {"executable": False, "why_not": "live execution moves one arm per plan (the checks assume a "
                                                     "single moving arm); plan each arm separately"}
         plan_id = uuid.uuid4().hex[:12]
         self.plans = {plan_id: {"created": time.monotonic(), "steps": steps,
-                                "start_q": {arms[0]: list(state[arms[0]]["q"])}}}   # only the newest plan is executable
+                                "start_q": {a: list(state[a]["q"]) for a in arms}}}   # only the newest plan is executable
         blockers = self.sender.blockers()
         return {"executable": not blockers, "plan_id": plan_id, "why_not": "; ".join(blockers), "steps": len(steps)}
 
@@ -125,16 +129,19 @@ class MotionService:
         return {"task_type": None, "name": "unknown", "status": None}
 
     def set_sdk_mode(self, on: bool) -> dict:
-        """Enter/exit SDK mode through the SDK's own system.set_work_mode (the WebUI-style platform task alone
-        leaves the SDK server saying "Sdk mode is not running"). Only with --live, only on a user click."""
+        """Enter SDK mode through the SDK's own system.set_work_mode (the platform task alone leaves the SDK
+        server saying "Sdk mode is not running"). EXIT goes through the platform's task STOP, because the SDK
+        refuses anything but SDK mode ("Only SDK mode is supported via this interface"). User clicks only."""
         if not self.sender.live_enabled:
             raise RuntimeError("robot mode changes need the server started with --live")
         if self.sender.status.get("state") == "running":
             raise RuntimeError("a plan is executing; stop it first")
-        res = self.sender.sdk_request({"cmd": "work_mode", "mode": "sdk" if on else "idle"}, timeout=20.0)
+        if not on:
+            return self.set_platform_task(False)
+        res = self.sender.sdk_request({"cmd": "work_mode", "mode": "sdk"}, timeout=20.0)
         if not res.get("ok"):
             raise RuntimeError(f"SDK refused: {res.get('error') or res.get('code')}")
-        return {"ok": True, "mode": "SDK" if on else "idle"}
+        return {"ok": True, "mode": "SDK"}
 
     def set_platform_task(self, on: bool) -> dict:
         """START/STOP the SDK task the way the robot's WebUI does (platform level). Kept for recovery."""
@@ -156,8 +163,10 @@ class MotionService:
     def robot_estop(self, recover: bool = False) -> dict:
         """The SDK's emergency stop (or its recovery). The physical red E-stop always works too."""
         self.sender.stop()
+        self.sender._log("Release E-stop pressed in this UI" if recover else "Robot E-stop pressed in this UI")
         res = self.sender.sdk_request({"cmd": "recover_estop" if recover else "estop"}, timeout=5.0)
         if not res.get("ok"):
+            self.sender._log(f"SDK refused: {res.get('error') or res.get('code')}")
             raise RuntimeError(f"SDK: {res.get('error') or res.get('code')}")
         return {"ok": True}
 
@@ -242,6 +251,9 @@ class MotionService:
         if parsed["pick"]:
             result.update(self.plan_pick(hub, state, parsed["pick"]))
             return result
+        if parsed["home"]:
+            result.update(self.plan_home(state, parsed["home"]["arm"]))
+            return result
         if parsed["moves"]:
             plan = self.planner.plan(parsed["moves"], state)
             result.update(ok=plan["ok"], checks=plan["checks"], targets=plan["targets"],
@@ -258,6 +270,20 @@ class MotionService:
         else:
             result.update(ok=False, checks=[], targets={})
         return result
+
+    def plan_home(self, state: dict, arm: str) -> dict:
+        """Plan a checked joint-space return to the ready pose. "both" = one arm after the other (both orders tried)."""
+        t0 = time.monotonic()
+        plan = home.plan_home_arms(self.planner, state, ["left", "right"] if arm == "both" else [arm])
+        out = {"ok": plan["ok"], "targets": {}, "plan_ms": round(1000 * (time.monotonic() - t0)),
+               "home": {"arm": arm, "order": plan["order"], "steps": len(plan["steps"]),
+                        "failure": None if plan["ok"] else {"phase": plan["failure"]["phase"],
+                                                            "failed": plan["failure"]["failed"]}},
+               "checks": plan["steps"][-1]["checks"] if plan["steps"] else []}
+        if plan["ok"]:
+            out["live"] = self._store_plan([{k: st[k] for k in ("arm", "q", "gripper", "phase")} for st in plan["steps"]],
+                                           state, sequential=True)
+        return out
 
     def plan_pick(self, hub, state: dict, pick: dict) -> dict:
         """Locate the object (vision model box + depth) and plan a checked pick sequence. DRY-RUN."""

@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Robot Eyes Stack</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  /* Layout: one engineering sheet. Ownership is the colour code: teal = our code, amber = robot platform, green = cloud. */
+  :root {
+    --bg: #f5f7f8; --panel: #ffffff; --fg: #16202a; --muted: #5a6672; --line: #c7cfd6;
+    --ours: #0d6e87; --ours-bg: #e2f0f4;
+    --robot: #8a5612; --robot-bg: #f7eedf;
+    --cloud: #2f7449; --cloud-bg: #e3f1e8;
+    --warn: #a3391f; --ok: #22744a;
+    --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #10161b; --panel: #172028; --fg: #e4eaef; --muted: #98a5b1; --line: #33414d;
+      --ours: #5cc3dd; --ours-bg: #13303a; --robot: #e2a64f; --robot-bg: #34281a;
+      --cloud: #6fcc92; --cloud-bg: #16301f; --warn: #ff8a6b; --ok: #6fcc92; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #10161b; --panel: #172028; --fg: #e4eaef; --muted: #98a5b1; --line: #33414d;
+    --ours: #5cc3dd; --ours-bg: #13303a; --robot: #e2a64f; --robot-bg: #34281a;
+    --cloud: #6fcc92; --cloud-bg: #16301f; --warn: #ff8a6b; --ok: #6fcc92; color-scheme: dark;
+  }
+  body { background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans); }
+  .wrap { max-width: 1080px; margin: 0 auto; padding-block: 28px 56px;
+          padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+          display: flex; flex-direction: column; gap: 28px; }
+  header { display: flex; flex-direction: column; gap: 6px; }
+  .eyebrow { font: 500 12px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-size: clamp(26px, 4vw, 34px); line-height: 1.15; margin: 0; text-wrap: balance; }
+  h2 { font-size: 19px; margin: 0; text-wrap: balance; }
+  p { margin: 0; max-width: 68ch; }
+  .muted { color: var(--muted); }
+  section { display: flex; flex-direction: column; gap: 12px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .sw { width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid; }
+  .sw.ours { background: var(--ours-bg); border-color: var(--ours); }
+  .sw.robot { background: var(--robot-bg); border-color: var(--robot); }
+  .sw.cloud { background: var(--cloud-bg); border-color: var(--cloud); }
+  figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .scroll { overflow-x: auto; }
+  svg { display: block; width: 100%; min-width: 760px; height: auto; color: var(--fg); font-family: var(--sans); }
+  figcaption { font-size: 13.5px; color: var(--muted); margin-top: 10px; max-width: 80ch; }
+  /* diagram classes */
+  .zone { fill: none; stroke: var(--line); stroke-width: 1.5; stroke-dasharray: 6 5; }
+  .zl { font: 600 11.5px var(--mono); letter-spacing: .06em; fill: var(--muted); }
+  .b-ours { fill: var(--ours-bg); stroke: var(--ours); stroke-width: 1.5; }
+  .b-robot { fill: var(--robot-bg); stroke: var(--robot); stroke-width: 1.5; }
+  .b-cloud { fill: var(--cloud-bg); stroke: var(--cloud); stroke-width: 1.5; }
+  .b-plain { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; }
+  .b-faded { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 4 4; }
+  .t { font: 600 13px var(--sans); fill: currentColor; }
+  .s { font: 400 11.5px var(--mono); fill: var(--muted); }
+  .e { fill: none; stroke: currentColor; stroke-width: 1.5; }
+  .e-live { fill: none; stroke: var(--warn); stroke-width: 2; }
+  .el { font: 500 11px var(--mono); fill: var(--muted); }
+  .el-live { font: 600 11px var(--mono); fill: var(--warn); }
+  .ah { fill: currentColor; }
+  .ah-live { fill: var(--warn); }
+  /* pipeline */
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .step { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+          display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .step .n { font: 600 12px var(--mono); color: var(--ours); }
+  .step.live .n { color: var(--warn); }
+  .step h3 { margin: 0; font-size: 15px; }
+  .step p { font-size: 13.5px; color: var(--muted); }
+  code { font: 12.5px var(--mono); background: var(--ours-bg); color: var(--fg); padding: 1px 5px; border-radius: 4px; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .card h3 { margin: 0; font-size: 15px; }
+  ul.status { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+  ul.status li { display: grid; grid-template-columns: 74px 1fr; gap: 10px; align-items: baseline; }
+  .pill { font: 600 11px var(--mono); text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; text-align: center; border: 1px solid; }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.next { color: var(--warn); border-color: var(--warn); }
+  .pill.rule { color: var(--robot); border-color: var(--robot); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font: 600 11.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+  td:first-child { font-family: var(--mono); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  table.modules td:nth-child(2) { white-space: nowrap; color: var(--muted); font-size: 12.5px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 8px; border: 1.5px solid; vertical-align: 0; }
+  .dot.ours { background: var(--ours-bg); border-color: var(--ours); }
+  .dot.robot { background: var(--robot-bg); border-color: var(--robot); }
+  .dot.cloud { background: var(--cloud-bg); border-color: var(--cloud); }
+  .back { font: 500 13px var(--mono); color: var(--ours); text-decoration: none; align-self: flex-start; }
+  .back:hover, .back:focus-visible { text-decoration: underline; }
+</style>
+<style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)} body{margin:0} img{max-width:100%} [hidden]{display:none!important}</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="back" href="/">← Back to Robot Eyes</a>
+  <span class="eyebrow">X-Square desktop robot · hackathon workspace</span>
+    <h1>How your Robot Eyes setup fits together</h1>
+    <p class="muted">Where each piece runs, what it talks to, and how a typed command becomes arm motion. Snapshot of 22 Nov 2026.</p>
+  </header>
+
+  <section>
+    <h2>Where everything runs</h2>
+    <div class="legend" aria-hidden="true">
+      <span><i class="sw ours"></i>our code (this repo)</span>
+      <span><i class="sw robot"></i>robot platform (X Square)</span>
+      <span><i class="sw cloud"></i>cloud service</span>
+      <span><svg width="26" height="10" style="min-width:0;width:26px"><line x1="0" y1="5" x2="26" y2="5" style="stroke:var(--warn);stroke-width:2"/></svg>the only path that moves the arm</span>
+    </div>
+    <figure>
+      <div class="scroll">
+        <svg viewBox="0 0 1000 660" role="img" aria-label="Your laptop runs the Robot Eyes web server, which reads the robot through rosbridge, asks Nebius about images and commands, and sends confirmed joint targets to the robot only through the SDK bridge on gRPC port 50051.">
+          <defs>
+            <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+            <marker id="ahl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-live"/></marker>
+          </defs>
+
+          <!-- zones -->
+          <rect class="zone" x="10" y="30" width="490" height="620" rx="12"/>
+          <text class="zl" x="26" y="54">YOUR LAPTOP · 192.168.77.18</text>
+          <rect class="zone" x="640" y="30" width="350" height="125" rx="12"/>
+          <text class="zl" x="656" y="54">CLOUD</text>
+          <rect class="zone" x="640" y="185" width="350" height="465" rx="12"/>
+          <text class="zl" x="656" y="209">ROBOT · 192.168.77.2</text>
+
+          <!-- laptop -->
+          <rect class="b-plain" x="30" y="70" width="450" height="48" rx="8"/>
+          <text class="t" x="255" y="92" text-anchor="middle">Browser · Robot Eyes page</text>
+          <text class="s" x="255" y="108" text-anchor="middle">camera · Ask · Arms · Move · Execute / Stop</text>
+
+          <rect class="b-ours" x="30" y="160" width="450" height="258" rx="10" style="fill-opacity:.35"/>
+          <text class="zl" x="46" y="182" style="fill:var(--ours)">perception/webui.py · 127.0.0.1:8080</text>
+
+          <rect class="b-ours" x="48" y="198" width="200" height="200" rx="8"/>
+          <text class="t" x="62" y="222">Move planner</text>
+          <text class="s" x="62" y="246">command_parser.py</text>
+          <text class="s" x="62" y="266">safety.py · 9 checks</text>
+          <text class="s" x="62" y="286">kinematics.py · URDF IK</text>
+          <text class="s" x="62" y="306">grasp.py · picks</text>
+          <text class="s" x="62" y="326">vision3d.py · depth→3D</text>
+          <text class="s" x="62" y="350">camera fix +7.3 cm</text>
+          <text class="s" x="62" y="370">(hand-eye calibration)</text>
+
+          <rect class="b-ours" x="268" y="198" width="194" height="52" rx="8"/>
+          <text class="t" x="282" y="220">nebius_vision.py</text>
+          <text class="s" x="282" y="238">Ask + command parsing</text>
+
+          <rect class="b-ours" x="268" y="268" width="194" height="52" rx="8"/>
+          <text class="t" x="282" y="290">FrameHub</text>
+          <text class="s" x="282" y="308">subscribe only · 4 fps</text>
+
+          <rect class="b-ours" x="268" y="346" width="194" height="52" rx="8"/>
+          <text class="t" x="282" y="368">sender.py</text>
+          <text class="s" x="282" y="386">only with --live</text>
+
+          <rect class="b-ours" x="268" y="500" width="194" height="56" rx="8"/>
+          <text class="t" x="282" y="523">sdk_bridge.py</text>
+          <text class="s" x="282" y="542">.venv-sdk · SDK v1.1.2</text>
+
+          <text class="s" x="30" y="628">CLI tools: see.py (ask from terminal) · record_commands.py (rosbag analysis)</text>
+
+          <!-- laptop internal edges -->
+          <line class="e" x1="255" y1="118" x2="255" y2="158" marker-start="url(#ah)" marker-end="url(#ah)"/>
+          <text class="el" x="263" y="143">HTTP · MJPEG</text>
+          <line class="e" x1="266" y1="224" x2="250" y2="224" marker-end="url(#ah)"/>
+          <line class="e" x1="266" y1="294" x2="250" y2="294" marker-end="url(#ah)"/>
+          <line class="e-live" x1="248" y1="372" x2="266" y2="372" marker-end="url(#ahl)"/>
+          <line class="e-live" x1="365" y1="398" x2="365" y2="498" marker-end="url(#ahl)"/>
+          <text class="el-live" x="373" y="452">checked plan,</text>
+          <text class="el-live" x="373" y="466">JSON lines</text>
+
+          <!-- cloud -->
+          <rect class="b-cloud" x="660" y="72" width="310" height="62" rx="8"/>
+          <text class="t" x="676" y="96">Nebius Token Factory</text>
+          <text class="s" x="676" y="116">Qwen3.8-27B · thinking off · ~1.2 s</text>
+
+          <!-- robot -->
+          <rect class="b-robot" x="660" y="236" width="140" height="62" rx="8"/>
+          <text class="t" x="674" y="260">rosbridge</text>
+          <text class="s" x="674" y="280">:9090 · ROS 2</text>
+
+          <rect class="b-robot" x="830" y="236" width="140" height="62" rx="8"/>
+          <text class="t" x="844" y="260">sdk2_server</text>
+          <text class="s" x="844" y="280">gRPC :50051</text>
+
+          <rect class="b-robot" x="830" y="344" width="140" height="62" rx="8"/>
+          <text class="t" x="844" y="368">Arm controllers</text>
+          <text class="s" x="844" y="388">joint · safety</text>
+
+          <rect class="b-robot" x="660" y="446" width="310" height="70" rx="8"/>
+          <text class="t" x="676" y="470">Hardware</text>
+          <text class="s" x="676" y="490">2 × 6-DOF arms · 2 grippers</text>
+          <text class="s" x="676" y="507">head RGB-D camera · 2 wrist cameras</text>
+
+          <rect class="b-faded" x="660" y="560" width="310" height="62" rx="8"/>
+          <text class="t" x="676" y="584" style="fill:var(--muted)">Platform WebUI :80 · modes</text>
+          <text class="s" x="676" y="604">operator login · Wall-X path (not used)</text>
+
+          <!-- cross-zone edges -->
+          <polyline class="e" points="462,222 540,222 540,104 658,104" marker-end="url(#ah)"/>
+          <text class="el" x="548" y="96">HTTPS</text>
+          <text class="el" x="548" y="148">images, text</text>
+
+          <polyline class="e" points="660,276 590,276 590,294 464,294" marker-end="url(#ah)"/>
+          <text class="el" x="470" y="336">read-only topics:</text>
+          <text class="el" x="470" y="350">camera · joints · force</text>
+
+          <polyline class="e-live" points="462,528 610,528 610,322 868,322 868,300" marker-end="url(#ahl)"/>
+          <text class="el-live" x="470" y="520">gRPC :50051</text>
+          <text class="el-live" x="470" y="548">joint targets ≤ 0.5°/step</text>
+
+          <line class="e-live" x1="935" y1="298" x2="935" y2="342" marker-end="url(#ahl)"/>
+          <line class="e-live" x1="900" y1="406" x2="900" y2="444" marker-end="url(#ahl)"/>
+          <text class="el-live" x="908" y="430">motors</text>
+
+          <line class="e" x1="730" y1="446" x2="730" y2="300" marker-end="url(#ah)"/>
+          <text class="el" x="738" y="380">state topics</text>
+        </svg>
+      </div>
+      <figcaption>Everything reaches the robot over the Ethernet link. Reading (cameras, joints, force) goes through rosbridge and never commands anything. The red path is the only one that can move the arm: a plan you confirmed, through <code>sender.py</code> and the official SDK, and only when the server runs with <code>--live</code> and the robot is in SDK mode.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>What each module does</h2>
+    <div class="card">
+      <div class="scroll">
+        <table class="modules">
+          <thead><tr><th>Module</th><th>Runs on</th><th>Task</th></tr></thead>
+          <tbody>
+            <tr><td><i class="dot ours"></i>webui.py</td><td>laptop</td><td>Web server: serves the page, streams cameras, routes Ask, Plan, Execute and mode buttons.</td></tr>
+            <tr><td><i class="dot ours"></i>FrameHub</td><td>laptop</td><td>One read-only rosbridge link: camera frames plus joint, gripper and force readings.</td></tr>
+            <tr><td><i class="dot ours"></i>nebius_vision.py</td><td>laptop</td><td>Calls Nebius: answers questions about camera images and interprets typed commands.</td></tr>
+            <tr><td><i class="dot ours"></i>command_parser.py</td><td>laptop</td><td>Turns a typed command into a move, a pick, or a go-home request.</td></tr>
+            <tr><td><i class="dot ours"></i>kinematics.py</td><td>laptop</td><td>Arm geometry from the robot's URDF: joint angles ⇄ gripper pose.</td></tr>
+            <tr><td><i class="dot ours"></i>safety.py</td><td>laptop</td><td>Checks every step: size, reach, joint limits, workspace, table clearance, arm separation.</td></tr>
+            <tr><td><i class="dot ours"></i>vision3d.py</td><td>laptop</td><td>Depth camera → 3D positions; corrects the head camera with the hand-eye calibration.</td></tr>
+            <tr><td><i class="dot ours"></i>grasp.py</td><td>laptop</td><td>Finds the object and plans open → above → descend → close → lift.</td></tr>
+            <tr><td><i class="dot ours"></i>home.py</td><td>laptop</td><td>Plans the return to the ready pose, one arm after the other.</td></tr>
+            <tr><td><i class="dot ours"></i>service.py</td><td>laptop</td><td>Glue: reads robot state, runs the planners, keeps the plan you confirm.</td></tr>
+            <tr><td><i class="dot ours"></i>sender.py</td><td>laptop</td><td>The only code that moves the robot: sends confirmed plans, paced to the arm, stops on problems.</td></tr>
+            <tr><td><i class="dot ours"></i>sdk_bridge.py</td><td>laptop</td><td>Runs the official SDK and relays the sender's commands to the robot over gRPC.</td></tr>
+            <tr><td><i class="dot ours"></i>record_commands.py</td><td>laptop</td><td>Read-only: records and analyses the robot's own commands to debug motion.</td></tr>
+            <tr><td><i class="dot cloud"></i>Nebius Token Factory</td><td>cloud</td><td>Hosts the Qwen3.8-27B vision-language model.</td></tr>
+            <tr><td><i class="dot robot"></i>rosbridge</td><td>robot :9090</td><td>Exposes ROS topics over WebSocket; we only read from it.</td></tr>
+            <tr><td><i class="dot robot"></i>sdk2_server</td><td>robot :50051</td><td>Official SDK server: SDK mode, control mode, joint targets.</td></tr>
+            <tr><td><i class="dot robot"></i>Arm controllers</td><td>robot</td><td>Joint and Cartesian controllers plus the safety controller; drive the motors.</td></tr>
+            <tr><td><i class="dot robot"></i>Platform WebUI</td><td>robot :80</td><td>X Square's operator UI and task modes; not used by us.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>From a typed command to motion</h2>
+    <p class="muted">The language model only proposes. Fixed code decides whether a move is allowed, and you confirm every plan.</p>
+    <ol class="steps">
+      <li class="step"><span class="n">1 · YOU</span><h3>Type a command</h3><p><code>left arm up 1 cm</code> or <code>pick the cube in front of you</code>. Directions are from the robot's point of view.</p></li>
+      <li class="step"><span class="n">2 · NEBIUS</span><h3>Turn words into a move</h3><p>Returns JSON: arm, translation, rotation, gripper; or a pick target; or a clarifying question.</p></li>
+      <li class="step"><span class="n">3 · PICKS ONLY</span><h3>Find the object in 3D</h3><p>Vision-model box (0–1000 scale) → depth camera → position in <code>base_link</code>, with the 7.3 cm camera correction.</p></li>
+      <li class="step"><span class="n">4 · SAFETY PLANNER</span><h3>Check every step</h3><p>IK from the robot's own URDF. Step ≤ 3 cm / 15°, 5° joint-limit margin, workspace and reach, table clearance and arm separation at 6 points along the path.</p></li>
+      <li class="step live"><span class="n">5 · YOU</span><h3>Confirm</h3><p>Plan must be under 60 s old and the arm must not have moved more than 1° since planning.</p></li>
+      <li class="step live"><span class="n">6 · SDK</span><h3>Send gently</h3><p>Robot in SDK mode, joint-position control, targets in ≤ 0.5° pieces at 50 Hz. Aborts if the mode switch alone moves the arm.</p></li>
+      <li class="step live"><span class="n">7 · WATCH</span><h3>Confirm arrival</h3><p>Within 4 mm in 4 s, or stop. A force jump over 15 N stops and holds. The red E-stop always works.</p></li>
+    </ol>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <h3>Where things stand</h3>
+      <ul class="status">
+        <li><span class="pill ok">works</span><span>Live cameras, Ask, arm readings (verified on the robot)</span></li>
+        <li><span class="pill ok">works</span><span>Move and pick planning with all checks (82 offline tests)</span></li>
+        <li><span class="pill ok">works</span><span>SDK connection (v1.1.2, gRPC :50051); SDK mode entered from the UI</span></li>
+        <li><span class="pill ok">works</span><span>Live moves through the SDK: typed command → checked plan → arm moves. Plan right before Execute (SDK mode settles the arm slightly)</span></li>
+        <li><span class="pill ok">works</span><span>Go home for one or both arms (one after the other)</span></li>
+        <li><span class="pill next">next</span><span>Left arm: joint controller was found inactive; retry after Enter SDK mode, then a pick</span></li>
+        <li><span class="pill rule">rule</span><span>Shared robot: teammates clear, hand on E-stop, Exit SDK mode when done</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Ports on the robot</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Port</th><th>Service</th><th>We use it for</th></tr></thead>
+          <tbody>
+            <tr><td>9090</td><td>rosbridge (ROS 2)</td><td>reading cameras, joints, force, modes</td></tr>
+            <tr><td>50051</td><td>sdk2_server (gRPC)</td><td>SDK mode and arm commands</td></tr>
+            <tr><td>80</td><td>platform WebUI</td><td>not used (needs operator login)</td></tr>
+            <tr><td>8888</td><td>WebSocket, unknown API</td><td>not used</td></tr>
+            <tr><td>8080*</td><td>our Robot Eyes UI</td><td>*on the laptop, localhost only</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</div>
+
+</body>
+</html>

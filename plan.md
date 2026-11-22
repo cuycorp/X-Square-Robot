@@ -150,7 +150,22 @@ Runs alongside the Phase 2 blocker: rosbridge `:9090` serves the cameras with no
 - [x] First attempt via raw pose_cmd: the arm didn't move (platform in base mode ignores external commands).
 - [x] Official SDK v1.1.2 (gRPC :50051) connected; sender now uses `set_joint_positions` in SDK mode; UI has
       Enter/Exit SDK mode + Robot E-stop. 70 offline tests; bridge verified read-only on the robot.
-- [ ] First live test via SDK (on our turn, teammates clear): "left arm up 1 cm", hand on the E-stop.
+- [x] **First live move via SDK works (2026-11-22):** typed command → checked plan → `set_joint_positions` → arm
+      moved. Lessons: SDK mode must be entered by the server's own connection (UI button; it ends when that
+      connection closes), and the arm settles ~2° when SDK mode takes over, so plan right before Execute.
+- [x] Architecture page in the UI (`/architecture`, "Architecture" button) + shared artifact.
+- [x] Pick execution: commands now paced by the arm's real progress (≤ 8 mm / 4° lead) because the controller's
+      jump detection (2 cm / 0.2 rad) slowed the arm to ~1 %. The arm then moved through pick steps.
+- [x] "Go home" command (checked joint steps ≤ 10° to a ready pose 6° off the limits); workspace check now lets an
+      arm that is outside move back in. 79 tests.
+- [x] Contact check now uses sudden jumps (> 12 N in 0.3 s) or a large total (> 40 N): pose-dependent drift of the
+      force estimate (18 N over a long go-home) caused a false stop.
+- [x] Left arm didn't move: its SDK targets reached `/left_arm_joint_controller/commands` while that controller
+      was inactive. The sender now always re-requests joint control and names an inactive controller when an arm
+      doesn't follow. Camera subscription watchdog added. Exit SDK mode goes through the platform STOP.
+- [x] "both arms go home" + a "Both arms home" button: arms move one after the other, each checked against the
+      other's real position; both orders tried. 82 tests.
+- [ ] Next: Both arms home → "grab the cube with the left arm". Watch: the USB Ethernet adapter dropped 3 times.
 - [ ] When done: **Exit SDK mode** (shared robot).
 - [ ] First live test (only after both of the above): left arm +1 cm in z, hand on the E-stop; expect
       `end_pose` z +1.0 cm and nothing else.

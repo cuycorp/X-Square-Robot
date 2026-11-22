@@ -162,7 +162,10 @@ class LiveSender:
             raise RuntimeError(f"the arm moved {drift:.1f}° since planning; plan again")
         self._stop.clear()
         with self._lock:
-            self.status = {"state": "running", "step": 0, "total": len(plan["steps"]), "message": "starting", "log": []}
+            # Keep earlier runs in the log (a new run used to wipe the evidence of the previous one).
+            self.status = {"state": "running", "step": 0, "total": len(plan["steps"]), "message": "starting",
+                           "log": self.status.get("log", [])[-25:] + [f"{time.strftime('%H:%M:%S')} ---- new run: "
+                                                                      f"{len(plan['steps'])} steps ----"]}
         threading.Thread(target=self._run, args=(plan, hub, read_state), daemon=True).start()
         return self.status
 
@@ -188,12 +191,14 @@ class LiveSender:
                 send_move = lambda h, rs, st, b: self._move_ros(ws, h, rs, st, b)       # noqa: E731
                 send_gripper = lambda h, rs, st, b: self._gripper_ros(ws, h, rs, st, b)  # noqa: E731
             baseline = {s: v["force"] for s, v in read_state(hub).items() if v["force"] is not None}
+            self._force_hist = []
             for i, st in enumerate(plan["steps"], 1):
                 if self._stop.is_set():
                     raise RuntimeError("stopped by user")
                 with self._lock:
                     self.status["step"] = i
                 self._log(f"step {i}/{len(plan['steps'])}: {st['phase']} ({st['arm']} arm)")
+                self._step_started = time.monotonic()   # start of the contact-check grace period
                 if st.get("gripper") is not None:
                     send_gripper(hub, read_state, st, baseline)
                 else:
@@ -215,31 +220,85 @@ class LiveSender:
             raise RuntimeError(f"robot is not in SDK mode (it is in {st.get('operation_mode')!r}); enter SDK mode first")
         if st.get("estop"):
             raise RuntimeError("the robot's emergency stop is active")
-        if st.get("control_mode") != "joint_positions":
-            before = {s: np.asarray(read_state(hub)[s]["q"]) for s in sides}
-            res = self.sdk_request({"cmd": "set_mode", "mode": "joint_positions"}, timeout=10.0)
-            if not res.get("ok"):
-                raise RuntimeError(f"could not set joint-position control: {res.get('error')}")
-            self._log("control mode set to joint positions; checking the arm stays still")
-            time.sleep(0.8)
-            after = read_state(hub)
-            moved = max(float(np.degrees(np.max(np.abs(np.asarray(after[s]["q"]) - before[s])))) for s in sides)
-            if moved > self.cfg.get("max_start_drift_deg", 1.0):
-                raise RuntimeError(f"the arm moved {moved:.1f}° by itself after the mode change")
+        # Always (re)request joint-position control: the SDK remembers "joint_positions" across an SDK-mode
+        # restart while the robot's joint controllers are back off. Seen 2026-11-22: left-arm targets reached
+        # /left_arm_joint_controller/commands while that controller was inactive, so the arm ignored them.
+        before = {s: np.asarray(read_state(hub)[s]["q"]) for s in sides}
+        res = self.sdk_request({"cmd": "set_mode", "mode": "joint_positions"}, timeout=10.0)
+        if not res.get("ok"):
+            raise RuntimeError(f"could not set joint-position control: {res.get('error')}")
+        self._log("joint-position control requested; checking the controllers and that the arm stays still")
+        time.sleep(0.8)
+        after = read_state(hub)
+        moved = max(float(np.degrees(np.max(np.abs(np.asarray(after[s]["q"]) - before[s])))) for s in sides)
+        if moved > self.cfg.get("max_start_drift_deg", 1.0):
+            raise RuntimeError(f"the arm moved {moved:.1f}° by itself after the mode change")
+        # Diagnostic only: the SDK may switch a joint controller on when the first command arrives, so an inactive
+        # controller is reported (and named if the arm then does not follow) rather than blocking the plan.
+        try:
+            self._inactive_ctrl = [s for s, ok in self._joint_controllers_active(sides).items() if not ok]
+        except Exception:  # noqa: BLE001
+            self._inactive_ctrl = []
+        if self._inactive_ctrl:
+            self._log(f"note: {' and '.join(self._inactive_ctrl)} arm joint controller inactive before the first command")
+
+    def _joint_controllers_active(self, sides) -> dict:
+        """{side: is <side>_arm_joint_controller active?} from the robot's controller manager (read-only)."""
+        from websockets.sync.client import connect
+        with connect(self.url, open_timeout=5, max_size=None) as ws:
+            ws.send(json.dumps({"op": "call_service", "id": "lc", "service": "/controller_manager/list_controllers"}))
+            end = time.monotonic() + 10
+            while time.monotonic() < end:
+                m = json.loads(ws.recv(timeout=max(0.1, end - time.monotonic())))
+                if m.get("id") == "lc":
+                    states = {c["name"]: c["state"] for c in (m.get("values") or {}).get("controller", [])}
+                    return {s: states.get(f"{s}_arm_joint_controller") == "active" for s in sides}
+        raise RuntimeError("could not read the robot's controller states")
 
     def _move_sdk(self, hub, read_state, st, baseline):
+        """Feed the target in small joint increments, PACED by the arm's real progress.
+
+        The arm's cartesian controller has jump detection (position_threshold 2 cm, rotation_threshold 0.2 rad,
+        alpha_scale 0.01): a command more than 2 cm / 11.5° ahead of the arm makes it crawl at ~1 % speed. So the
+        next increment is only sent once the arm is within max_lead_m / max_lead_deg of the last one.
+        """
         side, q_t = st["arm"], np.asarray(st["q"])
+        arm = self.planner.arms[side]
         q0 = np.asarray(read_state(hub)[side]["q"])
+        T_start, T_goal = arm.fk(q0), arm.fk(q_t)
+        total = float(np.linalg.norm(T_goal[:3, 3] - T_start[:3, 3]))
+        lead_m = self.cfg.get("max_lead_m", 0.008)
+        lead_rad = math.radians(self.cfg.get("max_lead_deg", 4.0))
+        per_inc_timeout = self.cfg.get("increment_timeout_s", 1.5)
         period = 1.0 / max(1, self.cfg.get("interp_hz", 50))
-        for k, q in enumerate(joint_path(q0, q_t, math.radians(self.cfg.get("max_joint_step_deg", 0.5)))):
+        for q in joint_path(q0, q_t, math.radians(self.cfg.get("max_joint_step_deg", 0.5))):
             if self._stop.is_set():
                 raise RuntimeError("stopped by user")
             res = self.sdk_request({"cmd": "joints", "arm": side, "q": [float(v) for v in q]})
             if not res.get("ok"):
                 raise RuntimeError(f"SDK refused the joint target: {res.get('error') or res.get('code')}")
-            if k % 5 == 0:
-                self._check_force(read_state, hub, baseline)
-            time.sleep(period)
+            T_cmd, deadline = arm.fk(q), time.monotonic() + per_inc_timeout
+            while True:  # wait until the arm is close enough behind this command
+                if self._stop.is_set():
+                    raise RuntimeError("stopped by user")
+                state = self._check_force(read_state, hub, baseline)
+                T_now = arm.fk(np.asarray(state[side]["q"]))
+                lag = float(np.linalg.norm(T_now[:3, 3] - T_cmd[:3, 3]))
+                lag_rot = float(np.linalg.norm(K.rotation_error(T_cmd[:3, :3], T_now[:3, :3])))
+                if lag <= lead_m and lag_rot <= lead_rad:
+                    break
+                if time.monotonic() > deadline:
+                    done = total - float(np.linalg.norm(T_goal[:3, 3] - T_now[:3, 3]))
+                    hint = ""
+                    try:
+                        if not self._joint_controllers_active([side])[side]:
+                            hint = (f"; the robot's {side}_arm_joint_controller is INACTIVE, so it ignores the SDK's "
+                                    f"targets (try Exit SDK mode, then Enter SDK mode)")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise RuntimeError(f"{side} arm is not following: {1000 * lag:.0f} mm / {math.degrees(lag_rot):.1f}° behind "
+                                       f"the command after {per_inc_timeout:.1f} s (moved {1000 * done:.0f} of {1000 * total:.0f} mm){hint}")
+                time.sleep(period)
         self._wait_arrival(hub, read_state, side, q_t, baseline,
                            resend=lambda: self.sdk_request({"cmd": "joints", "arm": side, "q": [float(v) for v in q_t]}))
 
@@ -283,9 +342,36 @@ class LiveSender:
     # ---------- shared ----------
 
     def _check_force(self, read_state, hub, baseline):
+        """Contact = a SUDDEN force change, or a very large total one.
+
+        The robot's external-force estimate is not true contact force: it reads ~44 N untouched and drifts as the
+        pose changes (imperfect weight model). On 2026-11-22 a long "go home" drifted 18 N and tripped a plain
+        15 N-from-start limit. So: stop if it jumps > contact_jump_n within contact_window_s, or changes more than
+        contact_total_n from the start of the plan.
+        """
+        # Also: the estimate spikes briefly whenever the arm starts or stops (acceleration looks like contact;
+        # seen 2026-11-22: 18 N within 0.3 s at the start of a 1 cm move). So readings are median-filtered over
+        # 3 samples, and the jump test is skipped for contact_grace_s after each new step starts.
         st = read_state(hub)
-        alerts = safety.contact_alerts({s: v["force"] for s, v in st.items() if v["force"] is not None},
-                                       baseline, self.planner.cfg["contact_force_delta_n"])
+        now = time.monotonic()
+        raw = {s: np.asarray(v["force"], float) for s, v in st.items() if v["force"] is not None}
+        recent = (getattr(self, "_force_raw", []) + [raw])[-3:]
+        self._force_raw = recent
+        forces = {s: np.median([r[s] for r in recent if s in r], axis=0) for s in raw}
+        window = self.cfg.get("contact_window_s", 0.5)
+        hist = [(t, f) for t, f in getattr(self, "_force_hist", []) if now - t <= window] + [(now, forces)]
+        self._force_hist = hist
+        jump_n = self.cfg.get("contact_jump_n", 25.0)
+        in_grace = now - getattr(self, "_step_started", 0.0) < self.cfg.get("contact_grace_s", 0.6)
+        for s, f in forces.items():
+            older = [h[s] for _, h in hist[:-1] if s in h]
+            if older and not in_grace:
+                jump = max(float(np.linalg.norm(f - o)) for o in older)
+                if jump > jump_n:
+                    raise RuntimeError(f"unexpected force: {s} arm force jumped {jump:.0f} N within {window:.1f} s "
+                                       f"(limit {jump_n:.0f} N; now {np.round(f, 0).tolist()} N)")
+        alerts = safety.contact_alerts({s: list(f) for s, f in forces.items()}, baseline,
+                                       self.cfg.get("contact_total_n", 50.0))
         if alerts:
             raise RuntimeError("unexpected force: " + "; ".join(alerts))
         return st

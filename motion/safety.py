@@ -115,14 +115,8 @@ class SafetyPlanner:
             dq = float(np.max(np.abs(q1 - q_now[s])))
             checks.append(check("joint change", dq <= cfg["max_joint_change_rad"],
                                 f"largest joint change {np.degrees(dq):.1f}° (max {np.degrees(cfg['max_joint_change_rad']):.0f}°)", s))
-            p_goal = self.points(s, q1)
-            tip = p_goal["fingertip"]
-            in_box = (cfg["workspace_x"][0] <= tip[0] <= cfg["workspace_x"][1]
-                      and cfg["workspace_y"][0] <= tip[1] <= cfg["workspace_y"][1] and tip[2] <= cfg["workspace_z_max"])
-            checks.append(check("workspace box", in_box, f"fingertip at ({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f}) m", s))
-            reach = float(np.linalg.norm(p_goal["link6"] - self.world[s][:3, 3]))
-            checks.append(check("reach", reach <= cfg["max_reach_m"],
-                                f"{100 * reach:.0f} cm from the arm base (max {100 * cfg['max_reach_m']:.0f} cm)", s))
+            checks.extend(self._workspace_checks(s, q_now[s], q1))
+            tip = self.points(s, q1)["fingertip"]
             g_value = None
             if gripper is not None:
                 g_value = cfg["gripper_open"] if gripper == "open" else cfg["gripper_closed"]
@@ -139,6 +133,41 @@ class SafetyPlanner:
         checks.extend(self._path_checks(q_now, q_goal, list(goals), grasp_zone))
         return {"ok": all(c["ok"] for c in checks), "checks": checks, "targets": targets,
                 "q_goal": {s: q_goal[s].tolist() for s in K.ARMS}}
+
+    def _box_excess(self, tip) -> float:
+        """How far (m) the fingertip is outside the workspace box (0 when inside)."""
+        cfg = self.cfg
+        (x0, x1), (y0, y1) = cfg["workspace_x"], cfg["workspace_y"]
+        return float(max(0.0, x0 - tip[0]) + max(0.0, tip[0] - x1) + max(0.0, y0 - tip[1]) + max(0.0, tip[1] - y1)
+                     + max(0.0, tip[2] - cfg["workspace_z_max"]))
+
+    def _workspace_checks(self, s, q0, q1) -> list:
+        """Workspace box and reach, with the don't-make-it-worse rule (an arm already outside may move back in)."""
+        cfg = self.cfg
+        p0, p1 = self.points(s, q0), self.points(s, q1)
+        tip = p1["fingertip"]
+        e0, e1 = self._box_excess(p0["fingertip"]), self._box_excess(tip)
+        box_ok = e1 == 0 or e1 <= e0 + 1e-4
+        note = "" if e1 == 0 else f"; {100 * e1:.1f} cm outside, " + ("not getting worse" if box_ok else "getting worse")
+        base = self.world[s][:3, 3]
+        r0, r1 = (float(np.linalg.norm(p["link6"] - base)) for p in (p0, p1))
+        reach_ok = r1 <= cfg["max_reach_m"] or r1 <= r0 + 1e-4
+        return [check("workspace box", box_ok, f"fingertip at ({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f}) m{note}", s),
+                check("reach", reach_ok, f"{100 * r1:.0f} cm from the arm base (max {100 * cfg['max_reach_m']:.0f} cm)", s)]
+
+    def plan_joint_goal(self, side: str, q_goal, state: dict) -> dict:
+        """Check a joint-space move of one arm (used by "go home"): limits, joint change, workspace and the path."""
+        cfg = self.cfg
+        q_now = {s: np.asarray(state[s]["q"], float) for s in K.ARMS}
+        q1 = np.asarray(q_goal, float)
+        dq = float(np.max(np.abs(q1 - q_now[side])))
+        checks = [self._joint_limits(side, q_now[side], q1),
+                  check("joint change", dq <= cfg["max_joint_change_rad"],
+                        f"largest joint change {np.degrees(dq):.1f}° (max {np.degrees(cfg['max_joint_change_rad']):.0f}°)", side),
+                  *self._workspace_checks(side, q_now[side], q1)]
+        checks.extend(self._path_checks(q_now, {**q_now, side: q1}, [side], None))
+        return {"ok": all(c["ok"] for c in checks), "checks": checks, "q_goal": {**{s: q_now[s].tolist() for s in K.ARMS},
+                                                                                 side: q1.tolist()}}
 
     def _joint_limits(self, s, q0, q1) -> dict:
         a, m = self.arms[s], np.radians(self.cfg["joint_margin_deg"])

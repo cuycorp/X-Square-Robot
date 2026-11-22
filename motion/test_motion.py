@@ -132,6 +132,61 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(msgs[1]["topic"], "/left_gripper_controller/commands")
 
 
+@needs_urdf
+class HomeAndWorkspaceTests(unittest.TestCase):
+    # The awkward poses seen live on 2026-11-22 (degrees).
+    AWKWARD = {"left": [17.6, 108.8, -76.7, -33.7, -18.3, 5.1], "right": [39.0, 130.7, -47.3, -85.8, -39.2, 5.0]}
+
+    @classmethod
+    def setUpClass(cls):
+        import home
+        cls.H = home
+        cls.P = safety.SafetyPlanner(URDF_PATH.read_text(), safety.load_config())
+        cls.state = {s: {"q": list(np.radians(cls.AWKWARD[s])), "gripper": 1.3} for s in K.ARMS}
+
+    def test_home_from_awkward_pose_in_small_checked_steps(self):
+        for s in K.ARMS:
+            r = self.H.plan_home(self.P, self.state, s)
+            self.assertTrue(r["ok"], r["failure"])
+            prev = np.asarray(self.state[s]["q"])
+            for st in r["steps"]:
+                self.assertLessEqual(np.degrees(np.max(np.abs(np.asarray(st["q"]) - prev))), 10 + 1e-6)
+                prev = np.asarray(st["q"])
+            np.testing.assert_allclose(np.degrees(r["steps"][-1]["q"]), self.H.HOME_Q_DEG, atol=1e-9)
+
+    def test_both_arms_home_one_after_the_other(self):
+        r = self.H.plan_home_arms(self.P, self.state, ["left", "right"])
+        self.assertTrue(r["ok"], r["failure"])
+        arms = [st["arm"] for st in r["steps"]]
+        first, second = r["order"]
+        self.assertEqual(arms, [first] * arms.count(first) + [second] * arms.count(second))   # never interleaved
+        for side in ("left", "right"):
+            last = [st for st in r["steps"] if st["arm"] == side][-1]
+            np.testing.assert_allclose(np.degrees(last["q"]), self.H.HOME_Q_DEG, atol=1e-9)
+
+    def test_both_arms_home_plan_is_executable(self):
+        import service
+        svc = service.MotionService(URDF_PATH.read_text(), "m", live=True)
+        out = svc.plan_home(self.state, "both")
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["live"]["executable"], out["live"])
+        self.assertEqual(set(svc.plans[out["live"]["plan_id"]]["start_q"]), {"left", "right"})
+
+    def test_home_pose_clears_joint_margin(self):
+        m = self.P.joint_margins_deg("left", np.radians(self.H.HOME_Q_DEG))
+        self.assertTrue(np.all(m >= self.P.cfg["joint_margin_deg"]))
+
+    def test_arm_outside_workspace_may_move_back_in(self):
+        q0 = np.radians(self.AWKWARD["left"])          # fingertip ~1.4 cm beyond the box (x = 1.164 m)
+        stay = {c["name"]: c for c in self.P._workspace_checks("left", q0, q0)}
+        self.assertTrue(stay["workspace box"]["ok"])    # not moving is not "worse"
+        T = self.P.tip_pose("left", q0)
+        T_out = T.copy(); T_out[0, 3] += 0.02
+        q_out, _, _ = self.P.arms["left"].ik(self.P.link6_goal("left", T_out), q0)
+        worse = {c["name"]: c for c in self.P._workspace_checks("left", q0, q_out)}
+        self.assertFalse(worse["workspace box"]["ok"])  # moving further out is blocked
+
+
 class ContactTests(unittest.TestCase):
     def test_contact_alert_on_force_change(self):
         alerts = safety.contact_alerts({"left": [44, 9, 41], "right": [0, 0, 0]},
@@ -174,6 +229,14 @@ class PickParserTests(unittest.TestCase):
         self.assertEqual(out["pick"], {"object": "the Rubik's cube", "arm": None})
         self.assertIsNone(out["clarification"])
 
+    def test_home_command(self):
+        out = command_parser.parse_reply('{"moves": [], "home": {"arm": "right"}, "explanation": "home"}')
+        self.assertEqual(out["home"], {"arm": "right"})
+        self.assertIsNone(out["clarification"])
+        self.assertEqual(command_parser.parse_reply('{"moves": [], "home": {}}')["home"], {"arm": "both"})
+        with self.assertRaises(ValueError):
+            command_parser.parse_reply('{"moves": [], "home": {"arm": "middle"}}')
+
     def test_pick_bad_arm(self):
         with self.assertRaises(ValueError):
             command_parser.parse_reply('{"moves": [], "pick": {"object": "cube", "arm": "third"}}')
@@ -191,6 +254,28 @@ class BboxTests(unittest.TestCase):
         for bad in ("nothing", '{"bbox": [1, 2, 3]}', '{"bbox_2d": [500, 10, 400, 20]}', '{"bbox_2d": [0, 0, 1200, 10]}'):
             with self.assertRaises(ValueError, msg=bad):
                 grasp.parse_bbox(bad, 1280, 720)
+
+
+class CalibrationChainTests(unittest.TestCase):
+    def _tfs(self, with_mount=True):
+        t = {"camera_head_front_color_optical_frame": {"parent": "camera_head_front_color_frame"},
+             "camera_head_front_color_frame": {"parent": "camera_head_front_depth_frame"},
+             "camera_head_front_depth_optical_frame": {"parent": "camera_head_front_depth_frame"},
+             "camera_head_front_depth_frame": {"parent": "camera_head_front_link"}}
+        if with_mount:
+            t["camera_head_front_link"] = {"parent": "left_arm_base_link"}
+        return t
+
+    def test_complete_chain(self):
+        self.assertTrue(V.chain_complete(self._tfs()))
+
+    def test_missing_mount_is_incomplete(self):
+        # The failure seen on 2026-11-22: camera_head_front_link -> left_arm_base_link was not received.
+        self.assertFalse(V.chain_complete(self._tfs(with_mount=False)))
+
+    def test_cycle_does_not_hang(self):
+        t = {"camera_head_front_color_optical_frame": {"parent": "a"}, "a": {"parent": "camera_head_front_color_optical_frame"}}
+        self.assertFalse(V.chain_complete(t))
 
 
 class DepthAndCameraTests(unittest.TestCase):
@@ -361,6 +446,20 @@ class SenderTests(unittest.TestCase):
             self.assertLessEqual(np.degrees(np.max(np.abs(np.asarray(q) - prev))), 0.5 + 1e-9)
             prev = np.asarray(q)
 
+    def test_sdk_move_waits_for_a_lagging_arm_then_stops(self):
+        # The arm never moves: the sender must not run ahead (only the first increment is sent), then stop.
+        bridge = self.FakeBridge(follow=False)
+        snd = self.sdk_sender(bridge)
+        snd.cfg["increment_timeout_s"] = 0.2
+        target = self.q + np.radians([0, 12.0, -7.0, 0, 0, 0])
+        with self.assertRaisesRegex(RuntimeError, "not following"):
+            snd._move_sdk(None, self._state(self.q), {"arm": "left", "q": list(target)}, {})
+        sent = [np.asarray(r["q"]) for r in bridge.sent if r["cmd"] == "joints"]
+        arm = self.P.arms["left"]
+        lead = max(np.linalg.norm(arm.fk(q)[:3, 3] - arm.fk(self.q)[:3, 3]) for q in sent)
+        self.assertLess(lead, 0.008 + 0.006)   # never more than the 8 mm lead (+ one 0.5° increment) ahead
+        self.assertLess(len(sent), 20)         # far fewer than the full 12° path (24 increments)
+
     def test_relative_convention_matches_end_pose(self):
         m = self.S.pose_message(self.P, "left", self.q, "relative_to_neutral")
         expect = np.linalg.inv(self.P.neutral["left"]) @ self.P.arms["left"].fk(self.q)
@@ -398,11 +497,33 @@ class SenderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "did not reach"):
             self.make()._move_ros(FakeWS(), None, self._state(self.q), {"arm": "left", "q": target}, {})
 
-    def test_unexpected_force_stops(self):
+    def test_large_total_force_change_stops(self):
         target = list(self.q + np.array([0, 0.05, 0, 0, 0, 0]))
         with self.assertRaisesRegex(RuntimeError, "unexpected force"):
-            self.make()._move_ros(FakeWS(), None, self._state(self.q, force=(30, 0, 0)), {"arm": "left", "q": target},
+            self.make()._move_ros(FakeWS(), None, self._state(self.q, force=(60, 0, 0)), {"arm": "left", "q": target},
                                   {"left": [0, 0, 0], "right": [0, 0, 0]})
+
+    def test_slow_drift_does_not_stop_but_a_jump_does(self):
+        snd = self.make()
+        snd._force_hist = []
+        base = {"left": [44, 9, 41], "right": [0, 0, 0]}
+
+        def at(f):
+            return lambda hub: {s: {"q": list(self.q), "gripper": 0.0,
+                                    "force": list(f) if s == "left" else [0, 0, 0]} for s in K.ARMS}
+        import time as _t
+        # 1) Start-of-step spike (the 11:21 false stop: 18 N within 0.3 s): ignored during the grace period.
+        snd._step_started = _t.monotonic()
+        snd._check_force(at([44, 9, 41]), None, base)
+        snd._check_force(at([44, 9, 59]), None, base)
+        # 2) After the grace period, a single noisy sample is removed by the 3-sample median.
+        snd._step_started, snd._force_hist, snd._force_raw = 0.0, [], []
+        for _ in range(3):
+            snd._check_force(at([44, 9, 41]), None, base)
+        snd._check_force(at([44, 9, 80]), None, base)       # one 39 N outlier: median still 41
+        # 3) A sustained jump (real contact) stops it as soon as the median reflects it (2 of 3 samples high).
+        with self.assertRaisesRegex(RuntimeError, "jumped"):
+            snd._check_force(at([44, 9, 75]), None, base)   # median 75 → 34 N above the window's 41
 
 
 @needs_urdf
