@@ -30,7 +30,7 @@ SYSTEM_PROMPT = """You autonomously control a bimanual desktop robot (quanta_x1_
 Coordinate frame & camera layout:
 - Robot base frame in meters and radians: +X is forward away from the robot torso, +Y is robot's left, +Z is up.
 - Rotation is RPY [roll, pitch, yaw] with R = Rz(yaw) @ Ry(pitch) @ Rx(roll).
-- Coordinate verification: Verify arm correspondence using left_ee / right_ee (+Y is robot's left) together with front, left_wrist, and right_wrist camera views.
+- Front/top camera layout: On the quanta_x1_pro desktop station, the front/top camera looks forward over the workspace (robot LEFT arm is on the LEFT of the image, RIGHT arm on the RIGHT). Cross-check against left_wrist, right_wrist, and measured left_ee / right_ee (+Y is robot's left).
 - 'left_wrist' and 'right_wrist' are eye-in-hand cameras mounted on each respective gripper.
 - Gripper range: 0.0 is fully closed, max is 1.526 (gripper-g) or 5.5 (gripper-h). Typical open is ~0.85 * max, typical grasp close is ~0.05 * max.
 
@@ -348,7 +348,7 @@ class ClaudeEndPosePlanner:
         # Claude 5.5 omits temperature, budget_tokens, and assistant prefill.
         content = [
             {"type": "text", "text": _state_summary(req, self.history)},
-            {"type": "text", "text": "Camera 1: front (robot RIGHT arm is on LEFT of image, LEFT arm on RIGHT)"},
+            {"type": "text", "text": "Camera 1: front (top/head view: robot LEFT arm is on LEFT of image, RIGHT arm on RIGHT, verify against left_ee/right_ee)"},
             {
                 "type": "image",
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": req.images_b64["front"]},

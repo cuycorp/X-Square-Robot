@@ -691,7 +691,7 @@ CONSOLE_HTML = r"""<!doctype html>
   <div class="card" id="inference-frames" hidden>
     <h2>Frames used by the planner</h2>
     <div class="cams">
-      <div class="cam"><b>Front (Right arm on left)</b><img id="img_front" alt="front"></div>
+      <div class="cam"><b>Front / Top (Left arm on left)</b><img id="img_front" alt="front"></div>
       <div class="cam"><b>Left Wrist</b><img id="img_left_wrist" alt="left_wrist"></div>
       <div class="cam"><b>Right Wrist</b><img id="img_right_wrist" alt="right_wrist"></div>
     </div>
